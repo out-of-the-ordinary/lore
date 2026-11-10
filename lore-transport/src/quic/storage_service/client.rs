@@ -154,7 +154,7 @@ impl StorageClient {
         let transport_config = transport_config_with_env_overrides(TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
             expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
-            congestion_algorithm: CongestionAlgorithm::Bbr,
+            congestion_algorithm: CongestionAlgorithm::Bbr3,
             initial_cwnd: None,
         });
 
