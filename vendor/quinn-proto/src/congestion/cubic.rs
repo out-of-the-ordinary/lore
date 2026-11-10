@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 use crate::connection::RttEstimator;
+use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 
 /// CUBIC Constants.
@@ -96,6 +97,8 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -169,7 +172,10 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        _is_ecn: bool,
         _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
     ) {
         if self
             .recovery_start_time
@@ -228,6 +234,8 @@ impl Controller for Cubic {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 
@@ -289,7 +297,15 @@ mod tests {
         cubic.ssthresh = window;
         cubic.cubic_state.w_max = 12.0 * BASE_DATAGRAM_SIZE as f64;
 
-        cubic.on_congestion_event(now, now + Duration::from_millis(1), false, 0);
+        cubic.on_congestion_event(
+            now,
+            now + Duration::from_millis(1),
+            false,
+            false,
+            0,
+            0,
+            SpaceId::Data,
+        );
 
         assert_eq!(
             cubic.cubic_state.w_max,
@@ -314,7 +330,15 @@ mod tests {
         // After ten days without a congestion event, w_cubic exceeds u64::MAX.
         // Before this fix, computing the window increment overflowed.
         let later = now + Duration::from_secs(10 * 24 * 60 * 60);
-        cubic.on_ack(later, later, BASE_DATAGRAM_SIZE, false, &rtt);
+        cubic.on_ack(
+            later,
+            later,
+            BASE_DATAGRAM_SIZE,
+            0,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
 
         assert_eq!(cubic.window, window + BASE_DATAGRAM_SIZE);
     }

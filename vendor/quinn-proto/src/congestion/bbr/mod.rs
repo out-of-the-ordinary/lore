@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
 
-use crate::congestion::ControllerMetrics;
+use crate::congestion::{ControllerMetrics, SpaceId};
 use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
 use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
@@ -435,6 +435,8 @@ impl Controller for Bbr {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -465,6 +467,7 @@ impl Controller for Bbr {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        _space: SpaceId,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
         // LORE: the excess this returns no longer reaches `calculate_cwnd`; the call still updates
@@ -519,7 +522,10 @@ impl Controller for Bbr {
         _now: Instant,
         _sent: Instant,
         _is_persistent_congestion: bool,
+        _is_ecn: bool,
         lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
     }
@@ -549,6 +555,8 @@ impl Controller for Bbr {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: Some(self.pacing_rate * 8),
+            bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 
@@ -749,13 +757,13 @@ mod tests {
     /// Acks one packet at `now`, then records the ack's RTT `sample`, in the order
     /// `Connection::on_ack_received` does: BBR sees a sample at the following ack.
     fn ack(bbr: &mut Bbr, rtt: &mut RttEstimator, now: Instant, sample: Duration) {
-        bbr.on_ack(now, now, 1200, false, rtt);
+        bbr.on_ack(now, now, 1200, 0, SpaceId::Data, false, rtt);
         rtt.update(Duration::ZERO, sample, now);
     }
 
     /// Acks one packet at `now` without a new RTT sample.
     fn ack_without_sample(bbr: &mut Bbr, rtt: &RttEstimator, now: Instant) {
-        bbr.on_ack(now, now, 1200, false, rtt);
+        bbr.on_ack(now, now, 1200, 0, SpaceId::Data, false, rtt);
     }
 
     fn ms(millis: u64) -> Duration {
@@ -840,8 +848,8 @@ mod tests {
         bbr.on_sent(start + ms(1), 1_000_000, 2);
         let mut rtt = estimator();
         rtt.update(Duration::ZERO, Duration::from_micros(20), start);
-        bbr.on_ack(start + ms(2), start, 1_000_000, false, &rtt);
-        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, false, &rtt);
+        bbr.on_ack(start + ms(2), start, 1_000_000, 0, SpaceId::Data, false, &rtt);
+        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, 0, SpaceId::Data, false, &rtt);
         assert_eq!(bbr.max_bandwidth.get_estimate(), 1_000_000_000);
         assert_eq!(bbr.min_rtt, Duration::from_micros(20));
         assert_eq!(bbr.get_target_cwnd(1.0), 250_000);
@@ -858,12 +866,12 @@ mod tests {
         for packet in 0..millis {
             let now = start + ms(packet);
             if let Some((sent, bytes, _)) = previous {
-                bbr.on_ack(now, sent, bytes, app_limited, &rtt);
+                bbr.on_ack(now, sent, bytes, 0, SpaceId::Data, app_limited, &rtt);
             }
             let bytes = bbr.window().min(500_000);
             bbr.on_sent(now, bytes, packet);
             if let Some((_, _, acked)) = previous {
-                bbr.on_end_acks(now, bytes, app_limited, Some(acked));
+                bbr.on_end_acks(now, bytes, app_limited, Some(acked), SpaceId::Data);
                 rtt.update(Duration::ZERO, ms(1), now);
             }
             previous = Some((now, bytes, packet));
@@ -937,8 +945,8 @@ mod tests {
         bbr.on_sent(start + ms(1), 1_000_000, 2);
         let mut rtt = estimator();
         rtt.update(Duration::ZERO, Duration::from_micros(20), start);
-        bbr.on_ack(start + ms(2), start, 1_000_000, false, &rtt);
-        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, false, &rtt);
+        bbr.on_ack(start + ms(2), start, 1_000_000, 0, SpaceId::Data, false, &rtt);
+        bbr.on_ack(start + ms(3), start + ms(1), 1_000_000, 0, SpaceId::Data, false, &rtt);
         bbr.mode = Mode::ProbeRtt;
         assert!(bbr.get_probe_rtt_cwnd() > 100_000);
         assert_eq!(bbr.window(), 100_000);
