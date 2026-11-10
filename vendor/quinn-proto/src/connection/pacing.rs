@@ -187,7 +187,16 @@ impl Pacer {
         }
 
         let bytes_needed = bytes_to_send.min(self.quantum);
-        let fits_in_burst = self.burst_sent + bytes_needed <= self.quantum;
+        // LORE: one poll may drain every accumulated token (up to `capacity`), not just one
+        // `quantum`. A wakeup is requested for the instant a `quantum` has refilled, but coarse
+        // timers (tokio on Windows fires ~1.2ms late) deliver it much later; capping the poll at
+        // `quantum` (2 datagrams for BBRv3) then limits a connection to one quantum per timer
+        // tick regardless of `pacing_rate`, and BBR measures that throttled rate as its own
+        // bandwidth. `capacity` is bounded to a few ms of traffic and tokens only accrue at
+        // `rate`, so this cannot exceed the pacing rate on average; `min_burst_interval` still
+        // spaces burst starts by half a quantum.
+        let burst_limit = self.capacity.max(self.quantum);
+        let fits_in_burst = self.burst_sent + bytes_needed <= burst_limit;
         if self.tokens >= bytes_needed && fits_in_burst {
             if self.burst_sent == 0 {
                 self.burst_start = Some(now);
@@ -216,13 +225,13 @@ impl Pacer {
 
 /// Calculates a pacer capacity for a pacing rate (bytes/sec)
 ///
-/// Batches the greater of `BURST_INTERVAL_NANOS` or `MIN_BURST_SIZE` datagrams worth of traffic,
+/// Batches the greater of `RATE_BURST_INTERVAL_NANOS` or `MIN_BURST_SIZE` datagrams worth of traffic,
 /// limited to at most `MAX_BURST_INTERVAL` worth to avoid inducing excessive latency.
 fn rate_capacity(pacing_rate: u64, mtu: u16) -> u64 {
     let mtu = u64::from(mtu);
     let bytes_in = |nanos: u128| ((pacing_rate as u128 * nanos) / 1_000_000_000) as u64;
 
-    let target_capacity = bytes_in(BURST_INTERVAL_NANOS);
+    let target_capacity = bytes_in(RATE_BURST_INTERVAL_NANOS);
     // Never restrict capacity below one MTU.
     let max_capacity = Ord::max(bytes_in(MAX_BURST_INTERVAL_NANOS), mtu);
 
@@ -262,6 +271,12 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
 /// If kernel-level pacing is supported later a higher time here might be
 /// more applicable.
 const BURST_INTERVAL_NANOS: u128 = 2_000_000; // 2ms
+
+/// Bucket depth of the rate path, as time at the pacing rate
+///
+/// LORE: deeper than [`BURST_INTERVAL_NANOS`] so a late timer wakeup (Windows timer slack,
+/// ~1-2ms) finds its refilled tokens still in the bucket instead of clipped at `capacity`.
+const RATE_BURST_INTERVAL_NANOS: u128 = 4_000_000; // 4ms
 
 /// Maximum period of traffic to batch together on a slow connection (rate path only)
 ///
@@ -640,7 +655,7 @@ mod rate_path_tests {
     }
 
     #[test]
-    fn rate_path_burst_is_bounded_by_the_send_quantum() {
+    fn rate_path_burst_is_bounded_by_the_bucket_capacity() {
         let mtu = 1500;
         let rtt = Duration::from_millis(50);
         let window = 2_000_000;
@@ -652,15 +667,17 @@ mod rate_path_tests {
         let (_, burst) = burst_until_blocked(&mut pacer, rtt, mtu, now, &metrics)
             .expect("pacer must block once the burst limit is reached");
 
-        // Burst size must match `quantum` (1ms of traffic) within one MTU, even though
-        // bucket `capacity` holds `TARGET_BURST_INTERVAL` (2ms).
+        // LORE: a single poll may release the whole bucket (so late timers do not cap
+        // throughput at one quantum per tick), but never more than `capacity`.
+        let capacity = pacer.capacity;
+        assert!(capacity >= quantum, "bucket must hold at least one quantum");
         assert!(
-            burst <= quantum + u64::from(mtu),
-            "burst of {burst} bytes overshoots the {quantum} byte send quantum by over one datagram"
+            burst <= capacity + u64::from(mtu),
+            "burst of {burst} bytes overshoots the {capacity} byte bucket by over one datagram"
         );
         assert!(
-            burst + u64::from(mtu) >= quantum,
-            "burst of {burst} bytes undershoots the {quantum} byte send quantum by over one datagram"
+            burst + u64::from(mtu) >= capacity,
+            "burst of {burst} bytes undershoots the {capacity} byte bucket by over one datagram"
         );
     }
 
@@ -700,9 +717,10 @@ mod rate_path_tests {
                  pacing_rate {expected}"
             );
             assert!(
-                max_burst <= quantum + u64::from(mtu),
-                "{late:?} late wakes: burst of {max_burst} bytes overshoots the {quantum} byte \
-                 send quantum by over one datagram"
+                max_burst <= pacer.capacity + u64::from(mtu),
+                "{late:?} late wakes: burst of {max_burst} bytes overshoots the {} byte \
+                 bucket by over one datagram",
+                pacer.capacity
             );
         }
     }
@@ -750,9 +768,10 @@ mod rate_path_tests {
              {expected}"
         );
         assert!(
-            max_burst <= quantum + u64::from(mtu),
-            "burst of {max_burst} bytes overshoots the {quantum} byte send quantum by over one \
-             datagram"
+            max_burst <= pacer.capacity + u64::from(mtu),
+            "burst of {max_burst} bytes overshoots the {} byte bucket by over one \
+             datagram",
+            pacer.capacity
         );
     }
 
@@ -791,11 +810,12 @@ mod rate_path_tests {
             timer,
         );
 
-        // Accumulated tokens after a stall must still be released in `quantum`-sized bursts.
+        // Accumulated tokens after a stall are clipped at `capacity`, so the catch-up burst is bounded by the bucket.
         assert!(
-            max_burst <= quantum + u64::from(mtu),
-            "burst of {max_burst} bytes after a stall overshoots the {quantum} byte send \
-             quantum by over one datagram"
+            max_burst <= pacer.capacity + u64::from(mtu),
+            "burst of {max_burst} bytes after a stall overshoots the {} byte bucket by \
+             over one datagram",
+            pacer.capacity
         );
         let expected = TEST_PACING_RATE * SECONDS;
         let slack = expected / 20;
@@ -803,6 +823,46 @@ mod rate_path_tests {
             sent <= expected + slack,
             "emitted {sent} bytes in {SECONDS}s, but pacing_rate allows only {expected}"
         );
+    }
+
+    /// LORE regression: BBRv3 sends 2-datagram quanta; a coarse timer that fires 1-2ms late on
+    /// every wakeup used to cap the connection at one quantum per tick (~2 MB/s) whatever the rate.
+    #[test]
+    fn rate_path_keeps_pacing_rate_with_tiny_quantum_and_slow_timer() {
+        const SECONDS: u64 = 2;
+
+        let mtu = 1230;
+        let rtt = Duration::from_millis(25);
+        let window = 2_000_000;
+        let metrics_for = |rate| paced_metrics(window, rate, 2 * u64::from(mtu));
+
+        for rate in [TEST_PACING_RATE, 2 * TEST_PACING_RATE] {
+            for late in [1000, 1200, 2000].map(Duration::from_micros) {
+                let metrics = metrics_for(rate);
+                let start = Instant::now();
+                let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+                let DriveStats { sent, .. } = drive_with_timer(
+                    &mut pacer,
+                    rtt,
+                    mtu,
+                    start,
+                    Duration::from_secs(SECONDS),
+                    &metrics,
+                    |requested| requested + late,
+                );
+
+                let expected = rate * SECONDS;
+                assert!(
+                    sent * 100 >= expected * 95,
+                    "rate {rate} B/s, {late:?} late wakes: emitted {sent} of {expected} bytes                      (<95% of the pacing rate)"
+                );
+                assert!(
+                    sent <= expected + expected / 20,
+                    "rate {rate} B/s, {late:?} late wakes: emitted {sent} bytes, above the                      {expected} byte pacing allowance"
+                );
+            }
+        }
     }
 
     #[test]
