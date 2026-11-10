@@ -607,3 +607,39 @@ mod controller_factory {
         assert_eq!(controller.window(), SMALL_SEND_WINDOW);
     }
 }
+
+#[test]
+fn quic_env_congestion_is_case_insensitive_and_rejects_unknown_names() {
+    assert!(matches!(parse_congestion_env(None), Ok(None)));
+    assert!(matches!(
+        parse_congestion_env(Some("CuBiC")),
+        Ok(Some(CongestionAlgorithm::Cubic))
+    ));
+    assert!(matches!(
+        parse_congestion_env(Some(" bbr ")),
+        Ok(Some(CongestionAlgorithm::Bbr))
+    ));
+    assert!(parse_congestion_env(Some("reno")).is_err());
+    assert!(parse_congestion_env(Some("")).is_err());
+}
+
+#[test]
+fn quic_env_rtt_accepts_only_positive_bounded_integers() {
+    assert_eq!(parse_expected_rtt_ms_env(None), Ok(None));
+    assert_eq!(parse_expected_rtt_ms_env(Some("265")), Ok(Some(265)));
+    for bad in ["0", "-1", "abc", "", "1.5", "60001", "99999999999999999999"] {
+        assert!(parse_expected_rtt_ms_env(Some(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn quic_env_bandwidth_converts_megabits_to_bytes_per_second() {
+    assert_eq!(parse_max_bandwidth_mbps_env(None), Ok(None));
+    assert_eq!(
+        parse_max_bandwidth_mbps_env(Some("1000")),
+        Ok(Some(125_000_000))
+    );
+    for bad in ["0", "-5", "fast", "", "1000001"] {
+        assert!(parse_max_bandwidth_mbps_env(Some(bad)).is_err(), "{bad}");
+    }
+}

@@ -274,6 +274,79 @@ pub struct TransportConfig {
     pub initial_cwnd: Option<u64>,
 }
 
+/// Env var selecting the congestion controller of client storage connections: `bbr` or `cubic`.
+pub const QUIC_CONGESTION_ENV_VAR: &str = "LORE_QUIC_CONGESTION";
+/// Env var setting the round-trip time, in milliseconds, that sizes the flow-control windows.
+pub const QUIC_EXPECTED_RTT_MS_ENV_VAR: &str = "LORE_QUIC_EXPECTED_RTT_MS";
+/// Env var setting the bandwidth, in megabits per second, that sizes the flow-control windows.
+pub const QUIC_MAX_BANDWIDTH_MBPS_ENV_VAR: &str = "LORE_QUIC_MAX_BANDWIDTH_MBPS";
+
+const MAX_EXPECTED_RTT_MS: u64 = 60_000;
+const MAX_BANDWIDTH_MBPS: u64 = 1_000_000;
+const BYTES_PER_SEC_PER_MBPS: u64 = 125_000;
+
+/// Parses `LORE_QUIC_CONGESTION`. Unset yields `None`; the name is case-insensitive.
+pub fn parse_congestion_env(value: Option<&str>) -> Result<Option<CongestionAlgorithm>, String> {
+    match value.map(str::trim) {
+        None => Ok(None),
+        Some(v) if v.eq_ignore_ascii_case("bbr") => Ok(Some(CongestionAlgorithm::Bbr)),
+        Some(v) if v.eq_ignore_ascii_case("cubic") => Ok(Some(CongestionAlgorithm::Cubic)),
+        Some(v) => Err(format!("expected `bbr` or `cubic`, got `{v}`")),
+    }
+}
+
+/// Parses `LORE_QUIC_EXPECTED_RTT_MS`: a positive number of milliseconds, at most one minute.
+pub fn parse_expected_rtt_ms_env(value: Option<&str>) -> Result<Option<u64>, String> {
+    parse_bounded_env(value, MAX_EXPECTED_RTT_MS)
+}
+
+/// Parses `LORE_QUIC_MAX_BANDWIDTH_MBPS` into bytes per second. The value is megabits per second,
+/// positive, at most 1,000,000.
+pub fn parse_max_bandwidth_mbps_env(value: Option<&str>) -> Result<Option<u64>, String> {
+    Ok(parse_bounded_env(value, MAX_BANDWIDTH_MBPS)?.map(|mbps| mbps * BYTES_PER_SEC_PER_MBPS))
+}
+
+fn parse_bounded_env(value: Option<&str>, max: u64) -> Result<Option<u64>, String> {
+    let Some(v) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    match v.parse::<u64>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(Some(n)),
+        _ => Err(format!("expected an integer from 1 to {max}, got `{v}`")),
+    }
+}
+
+/// Applies the `LORE_QUIC_*` environment overrides to `defaults`. The environment is read once
+/// per process; an invalid value logs a warning and keeps the default.
+pub fn transport_config_with_env_overrides(defaults: TransportConfig) -> TransportConfig {
+    static OVERRIDES: std::sync::OnceLock<(Option<CongestionAlgorithm>, Option<u64>, Option<u64>)> =
+        std::sync::OnceLock::new();
+    fn read<T>(name: &str, parse: impl Fn(Option<&str>) -> Result<Option<T>, String>) -> Option<T> {
+        let raw = std::env::var(name).ok();
+        parse(raw.as_deref()).unwrap_or_else(|err| {
+            lore_warn!("Ignoring {name}: {err}");
+            None
+        })
+    }
+    let (congestion, rtt_ms, bandwidth) = *OVERRIDES.get_or_init(|| {
+        (
+            read(QUIC_CONGESTION_ENV_VAR, parse_congestion_env),
+            read(QUIC_EXPECTED_RTT_MS_ENV_VAR, parse_expected_rtt_ms_env),
+            read(
+                QUIC_MAX_BANDWIDTH_MBPS_ENV_VAR,
+                parse_max_bandwidth_mbps_env,
+            ),
+        )
+    });
+    TransportConfig {
+        max_bytes_bandwidth_per_second: bandwidth
+            .unwrap_or(defaults.max_bytes_bandwidth_per_second),
+        expected_rtt_ms: rtt_ms.unwrap_or(defaults.expected_rtt_ms),
+        congestion_algorithm: congestion.unwrap_or(defaults.congestion_algorithm),
+        ..defaults
+    }
+}
+
 /// When working within a QUIC connection, these are the opportunities
 /// for any authentication/authorization to occur. Errors raised will be mapped to `QuicClientError`
 /// by the generic client logic
