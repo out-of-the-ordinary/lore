@@ -231,6 +231,8 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
 #[derive(Clone, Copy, Debug)]
 pub enum CongestionAlgorithm {
     Bbr,
+    /// BBRv3 (vendored quinn-proto).
+    Bbr3,
     Cubic,
 }
 
@@ -254,6 +256,15 @@ impl CongestionAlgorithm {
                 bbr.max_window(send_window);
                 Arc::new(bbr)
             }
+            CongestionAlgorithm::Bbr3 => {
+                // Bbr3Config has no max_window knob, so unlike `Bbr` the window is not capped
+                // at the send window.
+                let mut bbr3 = congestion::Bbr3Config::default();
+                if let Some(cwnd) = initial_window {
+                    bbr3.initial_window(cwnd);
+                }
+                Arc::new(bbr3)
+            }
             CongestionAlgorithm::Cubic => {
                 let mut cubic = congestion::CubicConfig::default();
                 if let Some(cwnd) = initial_window {
@@ -274,7 +285,7 @@ pub struct TransportConfig {
     pub initial_cwnd: Option<u64>,
 }
 
-/// Env var selecting the congestion controller of QUIC storage connections (client and server): `bbr` or `cubic`.
+/// Env var selecting the congestion controller of QUIC storage connections (client and server): `bbr`, `bbr3` or `cubic`.
 pub const QUIC_CONGESTION_ENV_VAR: &str = "LORE_QUIC_CONGESTION";
 /// Env var setting the round-trip time, in milliseconds, that sizes the flow-control windows.
 pub const QUIC_EXPECTED_RTT_MS_ENV_VAR: &str = "LORE_QUIC_EXPECTED_RTT_MS";
@@ -290,8 +301,9 @@ pub fn parse_congestion_env(value: Option<&str>) -> Result<Option<CongestionAlgo
     match value.map(str::trim) {
         None => Ok(None),
         Some(v) if v.eq_ignore_ascii_case("bbr") => Ok(Some(CongestionAlgorithm::Bbr)),
+        Some(v) if v.eq_ignore_ascii_case("bbr3") => Ok(Some(CongestionAlgorithm::Bbr3)),
         Some(v) if v.eq_ignore_ascii_case("cubic") => Ok(Some(CongestionAlgorithm::Cubic)),
-        Some(v) => Err(format!("expected `bbr` or `cubic`, got `{v}`")),
+        Some(v) => Err(format!("expected `bbr`, `bbr3` or `cubic`, got `{v}`")),
     }
 }
 
