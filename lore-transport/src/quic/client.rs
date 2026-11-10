@@ -274,7 +274,7 @@ pub struct TransportConfig {
     pub initial_cwnd: Option<u64>,
 }
 
-/// Env var selecting the congestion controller of client storage connections: `bbr` or `cubic`.
+/// Env var selecting the congestion controller of QUIC storage connections (client and server): `bbr` or `cubic`.
 pub const QUIC_CONGESTION_ENV_VAR: &str = "LORE_QUIC_CONGESTION";
 /// Env var setting the round-trip time, in milliseconds, that sizes the flow-control windows.
 pub const QUIC_EXPECTED_RTT_MS_ENV_VAR: &str = "LORE_QUIC_EXPECTED_RTT_MS";
@@ -338,8 +338,18 @@ pub fn transport_config_with_env_overrides(defaults: TransportConfig) -> Transpo
             ),
         )
     });
+    apply_transport_overrides(defaults, congestion, rtt_ms, bandwidth)
+}
+
+/// Replaces the fields of `defaults` for which an override is present.
+pub fn apply_transport_overrides(
+    defaults: TransportConfig,
+    congestion: Option<CongestionAlgorithm>,
+    rtt_ms: Option<u64>,
+    bandwidth_bytes_per_second: Option<u64>,
+) -> TransportConfig {
     TransportConfig {
-        max_bytes_bandwidth_per_second: bandwidth
+        max_bytes_bandwidth_per_second: bandwidth_bytes_per_second
             .unwrap_or(defaults.max_bytes_bandwidth_per_second),
         expected_rtt_ms: rtt_ms.unwrap_or(defaults.expected_rtt_ms),
         congestion_algorithm: congestion.unwrap_or(defaults.congestion_algorithm),
