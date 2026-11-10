@@ -619,6 +619,10 @@ fn quic_env_congestion_is_case_insensitive_and_rejects_unknown_names() {
         parse_congestion_env(Some(" bbr ")),
         Ok(Some(CongestionAlgorithm::Bbr))
     ));
+    assert!(matches!(
+        parse_congestion_env(Some("BBR3")),
+        Ok(Some(CongestionAlgorithm::Bbr3))
+    ));
     assert!(parse_congestion_env(Some("reno")).is_err());
     assert!(parse_congestion_env(Some("")).is_err());
 }
