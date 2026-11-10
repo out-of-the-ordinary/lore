@@ -4652,18 +4652,22 @@ mod controller_hooks {
         );
     }
 
-    /// `C.send_quantum` also bounds what is released at a single instant, not just what one call
-    /// writes: `drive_transmit` re-enters `poll_transmit` at the same `now` while the pacer still
-    /// has credit, and each call is handed the batch limit afresh. A pacer holding more credit than
-    /// the quantum allows would therefore start several quanta back to back.
+    /// What is released at a single instant is bounded by the pacer's bucket, not just by one
+    /// call's batch: `drive_transmit` re-enters `poll_transmit` at the same `now` while the pacer
+    /// still has credit. LORE: this deliberately differs from quinn#2481, which bounded the whole
+    /// instant by one quantum; that let a late timer wakeup release only one quantum (2 datagrams
+    /// for BBRv3) per tick, capping throughput. The bucket (a few ms of traffic, at most
+    /// `MAX_BURST_SIZE` datagrams) is the bound now.
     #[test]
-    fn send_quantum_bounds_repeated_poll_transmits() {
-        /// Datagrams the reported quantum should permit per instant.
+    fn pacer_bucket_bounds_repeated_poll_transmits() {
+        /// Datagrams the reported quantum should permit per call.
         const QUANTUM_DATAGRAMS: usize = 3;
+        /// Largest pacer bucket (`MAX_BURST_SIZE`) in datagrams.
+        const BUCKET_DATAGRAMS: usize = 256;
         /// Datagrams the caller is willing to accept per call, well above the quantum.
         const MAX_DATAGRAMS: usize = 10;
         /// Far more than the quantum, so the sender stays backlogged for the whole probe.
-        const WRITTEN: usize = 256 * 1024;
+        const WRITTEN: usize = 1024 * 1024;
 
         let _guard = subscribe();
 
@@ -4705,9 +4709,9 @@ mod controller_hooks {
             "the sender was never allowed to transmit, so this proves nothing"
         );
         assert!(
-            datagrams <= QUANTUM_DATAGRAMS + 1,
-            "released {datagrams} datagrams at one instant, over the {QUANTUM_DATAGRAMS} the send \
-             quantum allows (plus one datagram of slack)"
+            datagrams <= BUCKET_DATAGRAMS + 1,
+            "released {datagrams} datagrams at one instant, over the {BUCKET_DATAGRAMS} the pacer \
+             bucket allows (plus one datagram of slack)"
         );
     }
 
