@@ -1,0 +1,45 @@
+# Fork-only: builds loreserver from source (lore-server/Dockerfile) at a chosen
+# git ref and pushes it to ghcr.io/<owner>/lore/loreserver:<tag>. amd64 only.
+name: Build loreserver (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (branch, tag or SHA) to build
+        type: string
+        required: true
+      tag:
+        description: Image tag to publish, for example "0.13.0-quicenv"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/lore/loreserver" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: lore-server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.img.outputs.name }}:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

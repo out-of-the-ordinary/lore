@@ -10,7 +10,9 @@ use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
 use lore_transport::quic::client::RECEIVE_BUFFER_BYTES;
+use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::raise_receive_buffer;
+use lore_transport::quic::client::transport_config_with_env_overrides;
 use lore_transport::quic::net_runtime::NetRuntime;
 use opentelemetry::KeyValue;
 use quinn::AckFrequencyConfig;
@@ -101,8 +103,15 @@ impl QuinnServer {
             transport_config.max_idle_timeout(Some(settings.idle_timeout.try_into()?));
             transport_config.keep_alive_interval(Some(settings.keep_alive));
 
-            let bandwidth_estimate = settings.transport_bits_per_second / 8;
-            let recv_window = (bandwidth_estimate / 1000) * settings.transport_rtt;
+            // LORE_QUIC_* environment overrides apply to the server's send side too.
+            let transport = transport_config_with_env_overrides(TransportConfig {
+                max_bytes_bandwidth_per_second: (settings.transport_bits_per_second / 8) as u64,
+                expected_rtt_ms: settings.transport_rtt as u64,
+                congestion_algorithm: settings.congestion_algorithm,
+                initial_cwnd: None,
+            });
+            let bandwidth_estimate = transport.max_bytes_bandwidth_per_second;
+            let recv_window = (bandwidth_estimate / 1000) * transport.expected_rtt_ms;
             // Any stream can use at most 25% of available recv window
             let stream_recv_window = recv_window / 4;
             let send_window = recv_window;
@@ -110,13 +119,17 @@ impl QuinnServer {
             info!("QUIC recv window: {recv_window}");
             info!("QUIC send window: {send_window}");
             transport_config
-                .stream_receive_window(VarInt::from_u32(stream_recv_window as u32))
-                .receive_window(VarInt::from_u32(recv_window as u32))
+                .stream_receive_window(VarInt::from_u32(
+                    u32::try_from(stream_recv_window).unwrap_or(u32::MAX),
+                ))
+                .receive_window(VarInt::from_u32(
+                    u32::try_from(recv_window).unwrap_or(u32::MAX),
+                ))
                 .send_window(send_window as u64)
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
             transport_config.congestion_controller_factory(
-                settings.congestion_algorithm.controller_factory(
+                transport.congestion_algorithm.controller_factory(
                     settings.initial_cwnd.map(InitialCwndBytes::get),
                     send_window as u64,
                 ),

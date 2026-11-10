@@ -643,3 +643,33 @@ fn quic_env_bandwidth_converts_megabits_to_bytes_per_second() {
         assert!(parse_max_bandwidth_mbps_env(Some(bad)).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn quic_env_overrides_replace_only_the_fields_that_are_present() {
+    let defaults = || TransportConfig {
+        max_bytes_bandwidth_per_second: 1_000,
+        expected_rtt_ms: 50,
+        congestion_algorithm: CongestionAlgorithm::Bbr,
+        initial_cwnd: Some(7),
+    };
+    let unchanged = apply_transport_overrides(defaults(), None, None, None);
+    assert_eq!(unchanged.max_bytes_bandwidth_per_second, 1_000);
+    assert_eq!(unchanged.expected_rtt_ms, 50);
+    assert!(matches!(
+        unchanged.congestion_algorithm,
+        CongestionAlgorithm::Bbr
+    ));
+    let changed = apply_transport_overrides(
+        defaults(),
+        Some(CongestionAlgorithm::Cubic),
+        Some(265),
+        Some(125_000_000),
+    );
+    assert_eq!(changed.max_bytes_bandwidth_per_second, 125_000_000);
+    assert_eq!(changed.expected_rtt_ms, 265);
+    assert!(matches!(
+        changed.congestion_algorithm,
+        CongestionAlgorithm::Cubic
+    ));
+    assert_eq!(changed.initial_cwnd, Some(7));
+}
