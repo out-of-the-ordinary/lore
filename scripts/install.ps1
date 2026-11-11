@@ -141,6 +141,18 @@ function Save-Asset {
     }
 }
 
+# Write the user-level cli.toml that trusts our server's pre-commit hooks, unless one exists.
+function Write-DefaultCliConfig {
+    if (-not $env:LOCALAPPDATA) { return }
+    $dir  = Join-Path $env:LOCALAPPDATA 'Epic Games\lore\config'
+    $file = Join-Path $dir 'cli.toml'
+    if (Test-Path -LiteralPath $file) { Say "$file exists - not touching its [hooks] trust list"; return }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $toml = "[hooks]`n" + 'trusted = ["lore://lore.int.evorsolutions.com"]' + "`n"
+    [IO.File]::WriteAllText($file, $toml, (New-Object System.Text.UTF8Encoding($false)))
+    Say "wrote $file (trusts pre-commit hooks of lore://lore.int.evorsolutions.com)"
+}
+
 # Download, unpack, and install <bin>.exe into $InstallDir, replacing any existing copy.
 function Install-Binary {
     param([object]$Release, [string]$Bin)
@@ -167,6 +179,7 @@ function Install-Binary {
 
     $ver = (& $binPath --version 2>$null); if (-not $ver) { $ver = $Bin }
     Say "installed $ver -> $binPath"
+    if ($Bin -eq 'lore') { Write-DefaultCliConfig }
 }
 
 # Prepend $InstallDir to the persisted User PATH (if absent) and the live session.

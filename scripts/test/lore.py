@@ -1117,12 +1117,14 @@ class Lore:
         self,
         message: str | None = None,
         stats: bool = False,
+        no_verify: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["revision", "amend"]
             + ([message] if message else [])
-            + (["--stats"] if stats else []),
+            + (["--stats"] if stats else [])
+            + (["--no-verify"] if no_verify else []),
             **kwargs,
         )
 
@@ -2439,6 +2441,7 @@ class Lore:
         link_messages: dict[str, str] | None = None,
         layer: str | None = None,
         layer_messages: dict[str, str] | None = None,
+        no_verify: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
         if message is None:
@@ -2453,7 +2456,8 @@ class Lore:
             + (["--link", link] if link else [])
             + _link_message_args(link_messages)
             + (["--layer", layer] if layer else [])
-            + layer_args,
+            + layer_args
+            + (["--no-verify"] if no_verify else []),
             **kwargs,
         )
 

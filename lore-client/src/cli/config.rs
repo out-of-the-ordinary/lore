@@ -31,6 +31,16 @@ pub struct CliConfig {
     pub debug: bool,
     /// Disable interactive prompts
     pub non_interactive: bool,
+    /// Client hook trust settings
+    pub hooks: HooksUserConfig,
+}
+
+/// The `[hooks]` table of the user-level `cli.toml`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HooksUserConfig {
+    /// Remote URL or repository path prefixes whose `.lorehooks.toml` may run (`"*"` trusts all).
+    pub trusted: Vec<String>,
 }
 
 impl Default for CliConfig {
@@ -41,6 +51,7 @@ impl Default for CliConfig {
             pager: DEFAULT_PAGER.to_string(),
             debug: false,
             non_interactive: false,
+            hooks: HooksUserConfig::default(),
         }
     }
 }
@@ -50,12 +61,15 @@ impl Default for CliConfig {
 struct CliUserConfig {
     /// Which paginator to use
     pub pager: String,
+    /// Client hook trust settings
+    pub hooks: HooksUserConfig,
 }
 
 impl Default for CliUserConfig {
     fn default() -> Self {
         CliUserConfig {
             pager: DEFAULT_PAGER.to_string(),
+            hooks: HooksUserConfig::default(),
         }
     }
 }
@@ -74,10 +88,12 @@ pub fn setup_config(
         pager: DEFAULT_PAGER.to_string(),
         debug,
         non_interactive,
+        hooks: HooksUserConfig::default(),
     };
 
     if let Ok(user_config) = load_user_config_file() {
         config.pager = user_config.pager;
+        config.hooks = user_config.hooks;
     }
 
     if no_pager || json {

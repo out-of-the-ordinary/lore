@@ -1142,16 +1142,21 @@ Commit the staged state
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple
   times
+* `--no-verify` — Skip the pre-commit hook
 
 ## `lore revision amend`
 
 Amend the latest commit's message
 
-**Usage:** `lore revision amend <MESSAGE>`
+**Usage:** `lore revision amend [OPTIONS] <MESSAGE>`
 
 ###### **Arguments:**
 
 * `<MESSAGE>` — Commit message
+
+###### **Options:**
+
+* `--no-verify` — Skip the pre-commit hook
 
 ## `lore revision sync`
 
@@ -2481,6 +2486,7 @@ Commit the staged revision
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple
   times
+* `--no-verify` — Skip the pre-commit hook
 
 ## `lore sync`
 

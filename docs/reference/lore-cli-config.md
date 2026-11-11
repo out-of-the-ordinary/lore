@@ -124,7 +124,34 @@ The file is optional; when it's absent, Lore uses the defaults below.
 | --- | --- | --- | --- |
 | `pager` | string | `less -R` (Unix and macOS), `more.com` (Windows) | The pager program Lore pipes long output through. |
 
-`pager` is the only field Lore reads from `cli.toml` today. The CLI's other behavioral settings — JSON output, log level, debug logging, and non-interactive mode — are set per invocation through command-line flags, not through this file. Passing `--no-pager` (or requesting JSON output) overrides `pager` for that command and disables paging.
+### `[hooks]` table
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `trusted` | array of strings | `[]` | Repositories whose `.lorehooks.toml` pre-commit hook may run. An entry is a prefix of the repository's `remote_url`, a prefix of the repository's absolute root path, or `"*"` for every repository. |
+
+A remote entry matches case-insensitively and must end where a URL component ends, so `lore://lore.int.example.com` trusts `lore://lore.int.example.com:41337/game` but not `lore://lore.int.example.com.evil.net/game`. A path entry matches on a directory boundary (`D:/Work` trusts `D:/Work/Game`, not `D:/Workshop`), and case-insensitively on Windows. A repository that has a `.lorehooks.toml` but is not trusted prints a warning, and the commit goes ahead without the hook. See [Use pre-commit hooks](../how-to/use-pre-commit-hooks.md).
+
+```toml
+[hooks]
+trusted = ["lore://lore.int.example.com", "D:/Work/"]
+```
+
+`pager` and the `[hooks]` table are the only things Lore reads from `cli.toml` today. The CLI's other behavioral settings — JSON output, log level, debug logging, and non-interactive mode — are set per invocation through command-line flags, not through this file. Passing `--no-pager` (or requesting JSON output) overrides `pager` for that command and disables paging.
+
+## Repository `.lorehooks.toml`
+
+An optional, versioned file at the root of the working tree that declares the client-side `pre-commit` hook. Lore reads it on each `lore commit` and `lore revision amend`; without it there is no hook and no extra work. Only the top-level repository's file is read.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `version` | integer | required | Must be `1`. |
+| `[pre_commit].command` | array of strings | none | The program and its arguments, with no shell. A first element containing `/` or `\` is relative to the repository root, otherwise it is looked up on `PATH`. |
+| `[pre_commit].command_windows` | array of strings | `command` | Replaces `command` on Windows. |
+| `[pre_commit].command_unix` | array of strings | `command` | Replaces `command` on Linux and macOS. |
+| `[pre_commit].timeout_secs` | integer | `60` | Seconds before the hook is killed and the commit aborted. Allowed 1 to 600. |
+
+Unknown keys are errors. A broken file, a missing program or a timeout aborts the commit with exit code 100, as does a hook that exits non-zero. Pass `--no-verify` or set `LORE_NO_VERIFY=1` to skip the hook. The payload, the variables the hook receives, and example policy scripts are in [Use pre-commit hooks](../how-to/use-pre-commit-hooks.md).
 
 ## User-level `config.toml`
 
@@ -209,6 +236,13 @@ The Python test suite sets this per run, so running it leaves a service you have
 - A process with the variable set reaches over gRPC only the hosts the machine server forwards to. It can use a remote of another scheme as well only if the machine server forwards that remote's host and the process has network access for the remote's QUIC storage, which it reaches over one storage connection. In a container with no network, as usual, only `lore-unix` remotes work.
 - Each process reads the variable once, from its own environment. The relay does not pass it to the Lore service, so set it for the service as well.
 - A Lore server refuses to start with the variable set in its own environment, since the variable would send the server's own gRPC into a socket (see [Container sockets](lore-server-config.md#container-sockets)).
+
+The variables below control the pre-commit hook.
+
+| Variable | Effect |
+| --- | --- |
+| `LORE_NO_VERIFY` | `1`, `true`, `yes` or `on` skips the pre-commit hook, like `--no-verify`. |
+| `LORE_TRUST_HOOKS` | The same spellings trust every repository for this process, which is meant for CI. |
 
 ## Examples
 

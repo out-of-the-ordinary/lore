@@ -178,12 +178,18 @@ pub struct RevisionCommitArgs {
     /// Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times.
     #[clap(long = "layer-message", num_args = 2, value_names = ["PATH", "MESSAGE"])]
     pub layer_messages: Vec<String>,
+    /// Skip the pre-commit hook
+    #[clap(long)]
+    pub no_verify: bool,
 }
 
 #[derive(Args)]
 pub struct RevisionAmendArgs {
     /// Commit message
     pub message: String,
+    /// Skip the pre-commit hook
+    #[clap(long)]
+    pub no_verify: bool,
 }
 
 #[derive(Args)]
@@ -1164,6 +1170,21 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
         Err(code) => return code,
     };
 
+    if let Err(code) = crate::hooks::run_pre_commit(
+        &globals,
+        crate::hooks::PreCommitInput {
+            operation: crate::hooks::Operation::Commit,
+            message: &args.message,
+            link: args.link.as_deref(),
+            layer: args.layer.as_deref(),
+            link_messages: (&link_paths, &link_msgs),
+            layer_messages: (&layer_paths, &layer_msgs),
+            no_verify: args.no_verify,
+        },
+    ) {
+        return code;
+    }
+
     let commit_args = LoreRevisionCommitArgs {
         message: LoreString::from(&args.message),
         link: LoreString::from(args.link.as_deref().unwrap_or("")),
@@ -1300,6 +1321,21 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
 
 pub fn handle_revision_amend(globals: LoreGlobalArgs, args: &RevisionAmendArgs) -> u8 {
     let histogram = Arc::new(Mutex::new(ChunkSizeHistogram::default()));
+
+    if let Err(code) = crate::hooks::run_pre_commit(
+        &globals,
+        crate::hooks::PreCommitInput {
+            operation: crate::hooks::Operation::Amend,
+            message: &args.message,
+            link: None,
+            layer: None,
+            link_messages: (&[], &[]),
+            layer_messages: (&[], &[]),
+            no_verify: args.no_verify,
+        },
+    ) {
+        return code;
+    }
 
     let amend_args = LoreRevisionAmendArgs {
         message: LoreString::from(&args.message),
