@@ -2,15 +2,15 @@
 # Install the Lore CLI (and, with --demo, a local loreserver) from GitHub Releases.
 #
 # Quick start:
-#   curl -fsSL https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.sh | bash -s -- --demo
+#   curl -fsSL https://raw.githubusercontent.com/out-of-the-ordinary/lore/ooto-main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/out-of-the-ordinary/lore/ooto-main/scripts/install.sh | bash -s -- --demo
 #
 # On Windows, use the PowerShell peer scripts/install.ps1.
 # For flags and their env-var equivalents, run with --help.
 
 set -euo pipefail
 
-REPO="${LORE_REPO:-EpicGames/lore}"
+REPO="${LORE_REPO:-out-of-the-ordinary/lore}"
 VERSION="${LORE_VERSION:-latest}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
 TOKEN="${GITHUB_TOKEN:-}"
@@ -36,7 +36,7 @@ Every flag has an env-var equivalent; the flag wins when both are set:
   --server             LORE_SERVER        only install loreserver (skip the lore CLI and auto-launch)
   --version <v>        LORE_VERSION       install a specific release tag (default: latest)
   --install-dir <dir>  LORE_INSTALL_DIR   where binaries go (default: ~/.local/bin)
-  --repo <owner/repo>  LORE_REPO          source repository (default: EpicGames/lore)
+  --repo <owner/repo>  LORE_REPO          source repository (default: out-of-the-ordinary/lore)
   --token <t>          GITHUB_TOKEN       token for private repos / higher rate limit (defaults to `gh auth token`)
   -h, --help                              show this help
 EOF

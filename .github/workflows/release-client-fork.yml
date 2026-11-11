@@ -1,0 +1,90 @@
+# Fork-only: builds the lore CLI for Windows and Linux at a release tag
+# (ooto-main-*) and publishes it as a GitHub Release. Asset names match what
+# scripts/install.ps1 / install.sh select: lore-<cargo version>-<tag>-<triple>.{zip,tar.gz}
+name: Release client (fork)
+
+on:
+  push:
+    tags: ['ooto-main-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release, for example "ooto-main-3"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential protobuf-compiler
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-client-${{ matrix.triple }}
+      - name: Build
+        run: cargo build --release --locked -p lore-client --bin lore
+      - name: Package
+        id: pkg
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          name="lore-${ver}-${TAG}-${{ matrix.triple }}"
+          mkdir -p "dist/$name"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/lore.exe "dist/$name/"
+            (cd dist && powershell -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'")
+            echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp target/release/lore "dist/$name/"
+            tar -czf "dist/$name.tar.gz" -C dist "$name"
+            echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lore-${{ matrix.triple }}
+          path: ${{ steps.pkg.outputs.file }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+              --notes "Lore CLI build of fork tag $TAG. Install: scripts/install.ps1 / install.sh"
+          fi
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber

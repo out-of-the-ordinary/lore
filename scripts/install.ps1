@@ -6,8 +6,8 @@
     PowerShell peer of scripts/install.sh. Works on Windows PowerShell 5.1 and PowerShell 7+.
 
     Quick start:
-      irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex
-      $env:LORE_DEMO=1; irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex
+      irm https://raw.githubusercontent.com/out-of-the-ordinary/lore/ooto-main/scripts/install.ps1 | iex
+      $env:LORE_DEMO=1; irm https://raw.githubusercontent.com/out-of-the-ordinary/lore/ooto-main/scripts/install.ps1 | iex
 
     For parameters and their env-var equivalents, run with -Help.
 .EXAMPLE
@@ -45,14 +45,14 @@ Every parameter has an env-var equivalent; the parameter wins when both are set:
   -Server            LORE_SERVER       only install loreserver (skip the lore CLI and auto-launch)
   -Version <v>       LORE_VERSION      install a specific release tag (default: latest)
   -InstallDir <dir>  LORE_INSTALL_DIR  where binaries go (default: %USERPROFILE%\bin)
-  -Repo <owner/repo> LORE_REPO         source repository (default: EpicGames/lore)
+  -Repo <owner/repo> LORE_REPO         source repository (default: out-of-the-ordinary/lore)
   -Token <t>         GITHUB_TOKEN      token for private repos / higher rate limit (defaults to `gh auth token`)
   -Help                                show this help
 "@ -split "`n" | ForEach-Object { [Console]::Error.WriteLine($_) }
 }
 if ($Help) { Show-Usage; exit 0 }
 
-if (-not $Repo)       { $Repo = 'EpicGames/lore' }
+if (-not $Repo)       { $Repo = 'out-of-the-ordinary/lore' }
 if (-not $Version)    { $Version = 'latest' }
 if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE 'bin' }
 # -Demo is a switch; also honor $env:LORE_DEMO (accepts 1/true/yes/on/enabled).
