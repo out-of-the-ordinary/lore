@@ -905,9 +905,20 @@ impl CompositeStore {
         );
 
         let mut error_to_return = StoreError::from(AddressNotFound::from(address));
+        // A read that could not be answered is not a read that was answered "not found": a
+        // durable store failing internally (timeout, throttling, I/O error) or a query task that
+        // died says nothing about whether the address exists, and reporting `AddressNotFound`
+        // for it makes callers treat a stored fragment as missing.
+        let mut unanswered: Option<StoreError> = None;
         while let Some(join_result) = fan_out.as_mut().next().await {
-            let Ok((is_durable, query_result)) = join_result else {
-                continue;
+            let (is_durable, query_result) = match join_result {
+                Ok(joined) => joined,
+                Err(join_error) => {
+                    unanswered.get_or_insert_with(|| {
+                        StoreError::internal_with_context(join_error, "Read query task failed")
+                    });
+                    continue;
+                }
             };
             match query_result {
                 Ok(result) => {
@@ -961,10 +972,20 @@ impl CompositeStore {
                         error_to_return = err;
                         break;
                     }
+                    if is_durable {
+                        // The durable store is the source of truth: keep its failure, which a
+                        // replica miss must not turn into a miss.
+                        unanswered = Some(err);
+                    }
                 }
             }
         }
 
+        if matches!(error_to_return, StoreError::AddressNotFound(_))
+            && let Some(unanswered) = unanswered
+        {
+            return Err(unanswered);
+        }
         Err(error_to_return)
     }
 
@@ -992,6 +1013,8 @@ impl CompositeStore {
         );
 
         let mut best_result = CompositeStoreHit::Miss(StoreGetData::default());
+        // The durable store failing to answer is not a miss: see `get_from_remotes`.
+        let mut durable_failure: Option<StoreError> = None;
 
         while let Some(join_result) = fan_out.as_mut().next().await {
             let Ok((is_durable, query_result)) = join_result else {
@@ -1016,8 +1039,17 @@ impl CompositeStore {
                     if is_durable && !error.is_slow_down() && !error.is_internal() {
                         break;
                     }
+                    if is_durable {
+                        durable_failure = Some(error);
+                    }
                 }
             }
+        }
+
+        if best_result.inner().match_made == StoreMatch::MatchNone
+            && let Some(error) = durable_failure
+        {
+            return Err(error);
         }
 
         if self.cache_metadata

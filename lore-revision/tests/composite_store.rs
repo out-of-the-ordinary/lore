@@ -830,6 +830,78 @@ mod tests {
             .await;
     }
 
+    /// A local cache that cannot be read (full disk, store lock refused) is a cache miss: the
+    /// read is answered by the durable store.
+    #[tokio::test]
+    async fn get_falls_back_to_durable_when_local_cache_fails() {
+        let local = Arc::new(TestStore::failing());
+        let durable = Arc::new(TestStore::succeeding());
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("failing, local".to_string(), local.clone())
+                        .expect("Failed add local")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build"),
+                );
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+                store
+                    .get(random::<RepositoryId>(), address)
+                    .await
+                    .expect("a failing local cache must not fail a read the durable store can serve");
+            })
+            .await;
+    }
+
+    /// A durable store that fails to answer (timeout, throttling, I/O error) says nothing about
+    /// whether the address exists: the read must surface that failure, never `AddressNotFound`,
+    /// or a client treats a fragment that exists as missing.
+    #[tokio::test]
+    async fn failing_durable_read_is_not_reported_as_address_not_found() {
+        let local = Arc::new(TestStore::failing());
+        let durable = Arc::new(TestStore::failing());
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("failing, local".to_string(), local.clone())
+                        .expect("Failed add local")
+                        .with_durable("failing, durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build"),
+                );
+                let partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+                let error = store
+                    .clone()
+                    .get(partition, address)
+                    .await
+                    .expect_err("both stores fail");
+                assert!(!error.is_address_not_found(), "get masked {error:?}");
+                assert!(error.is_internal(), "{error:?}");
+
+                let error = store
+                    .get_metadata(partition, address)
+                    .await
+                    .expect_err("both stores fail");
+                assert!(!error.is_address_not_found(), "get_metadata masked {error:?}");
+                assert!(error.is_internal(), "{error:?}");
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn get_metadata_consults_replica_when_local_misses() {
         let local = Arc::new(TestStore::failing());
