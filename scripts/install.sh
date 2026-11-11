@@ -138,6 +138,24 @@ install_binary() {
     say "installed $("$bin_path" --version 2>/dev/null || echo "$binary") -> $bin_path"
 }
 
+# Write the user-level cli.toml that trusts our server's pre-commit hooks, unless one exists.
+write_default_cli_config() {
+    local dir
+    case "$(uname -s)" in
+        Darwin) dir="$HOME/Library/Application Support/com.epicgames.lore" ;;
+        *) dir="${XDG_CONFIG_HOME:-$HOME/.config}/lore" ;;
+    esac
+    if [[ -e "$dir/cli.toml" ]]; then
+        say "$dir/cli.toml exists - not touching its [hooks] trust list"
+        return
+    fi
+    mkdir -p "$dir"
+    printf '[hooks]
+trusted = ["lore://lore.int.evorsolutions.com"]
+' > "$dir/cli.toml"
+    say "wrote $dir/cli.toml (trusts pre-commit hooks of lore://lore.int.evorsolutions.com)"
+}
+
 # Make sure $INSTALL_DIR is on PATH for this run, and persist it to the shell rc if missing.
 ensure_on_path() {
     case ":$PATH:" in *":$INSTALL_DIR:"*) return ;; esac

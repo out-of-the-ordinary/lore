@@ -14,6 +14,10 @@ mod commands;
 #[cfg(feature = "test-util")]
 pub mod commands;
 mod config;
+#[cfg(not(feature = "test-util"))]
+mod hooks;
+#[cfg(feature = "test-util")]
+pub mod hooks;
 mod logging;
 mod pager;
 mod print_macros;
