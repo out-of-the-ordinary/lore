@@ -767,3 +767,14 @@ fn selection_display_names_the_implementation() {
         "ResourceGrantsAuthorizer"
     );
 }
+
+#[test]
+fn label_is_a_distinct_action_outside_allow_all() {
+    assert_eq!(Action::Label.as_str(), "label");
+    assert!(!ALLOW_ALL_ACTIONS.contains(&Action::Label));
+    let label = Grants::Actions(["label".to_string()].into());
+    let write = Grants::Actions(["write".to_string()].into());
+    assert!(label.permits(Action::Label));
+    assert!(!label.permits(Action::Write));
+    assert!(!write.permits(Action::Label));
+}

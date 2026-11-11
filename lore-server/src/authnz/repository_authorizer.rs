@@ -30,6 +30,9 @@ pub enum Action {
     /// Implied by any grant on a partition: a caller who reaches it may read it.
     Read,
     Write,
+    /// Set repository metadata under `label/` and upload the blobs that needs;
+    /// nothing else a `write` allows.
+    Label,
     Owner,
     Admin,
     Migrate,
@@ -43,6 +46,7 @@ impl Action {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::Label => "label",
             Self::Owner => "owner",
             Self::Admin => "admin",
             Self::Migrate => "migrate",

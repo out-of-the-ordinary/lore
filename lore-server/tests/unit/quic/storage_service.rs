@@ -20,6 +20,7 @@ use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::connect::Connect;
 use lore_server::protocol::storage::copy::Copy;
 use lore_server::protocol::storage::messages::MessageHandleError;
+use lore_server::protocol::storage::put::Put;
 use lore_server::protocol::storage::query::Query;
 use lore_server::protocol::storage::verify::Verify;
 use lore_server::quic::QuicService;
@@ -199,5 +200,67 @@ async fn a_healing_verify_needs_write() {
     let writer = connected(repository, &["write"]);
     assert!(!refused(
         &service.run_request_handler(writer, verify(1)).await
+    ));
+}
+
+/// A `label` token may upload blobs (Put) but nothing else a `write` allows.
+#[tokio::test]
+async fn a_label_token_may_put_but_not_copy() {
+    let service = service().await;
+    let repository = random::<RepositoryId>();
+    let put = || {
+        let (fragment, address, payload) = lore_revision::fragment::generate_random();
+        ParsedStorageRequest::Put(Put {
+            address,
+            fragment,
+            payload: Some(payload),
+        })
+    };
+
+    let label = connected(repository, &["label"]);
+    assert!(!refused(
+        &service.run_request_handler(label.clone(), put()).await
+    ));
+    assert!(refused(
+        &service.run_request_handler(label, copy(repository)).await
+    ));
+
+    let read_only = connected(repository, &["read"]);
+    assert!(refused(
+        &service.run_request_handler(read_only, put()).await
+    ));
+}
+
+/// `PutResolved` writes the mutable store (a resolve key of the caller's choosing), so `label`
+/// does not cover it.
+#[tokio::test]
+async fn a_label_token_may_not_put_resolved() {
+    use zerocopy::IntoBytes;
+
+    let service = service().await;
+    let repository = random::<RepositoryId>();
+    let (fragment, address, payload) = lore_revision::fragment::generate_random();
+    let mut bytes = lore_base::types::Hash::hash_buffer(b"key")
+        .as_bytes()
+        .to_vec();
+    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(fragment.as_bytes());
+    bytes.extend_from_slice(&payload);
+    let put_resolved = || {
+        ParsedStorageRequest::PutResolved(
+            lore_server::protocol::storage::put_resolved::PutResolved::parse(Bytes::from(
+                bytes.clone(),
+            ))
+            .unwrap(),
+        )
+    };
+
+    let label = connected(repository, &["label"]);
+    assert!(refused(
+        &service.run_request_handler(label, put_resolved()).await
+    ));
+    let write = connected(repository, &["write"]);
+    assert!(!refused(
+        &service.run_request_handler(write, put_resolved()).await
     ));
 }

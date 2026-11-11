@@ -39,7 +39,7 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
-use crate::grpc::require_action;
+use crate::grpc::require_any_action;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::put::UnvalidatedPut;
 use crate::protocol::storage::put::handle_put;
@@ -114,7 +114,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResponseStream>, Status> {
-    require_action(authorizer, &request, Action::Write).await?;
+    require_any_action(authorizer, &request, &[Action::Write, Action::Label]).await?;
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

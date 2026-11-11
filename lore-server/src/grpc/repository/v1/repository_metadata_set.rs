@@ -69,14 +69,17 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            authorizer
-                .check_repository_access(
-                    get_verified_token(&extensions).as_ref(),
-                    repository_id.into(),
-                    Action::Write,
-                )
+            let token = get_verified_token(&extensions);
+            let write = authorizer
+                .check_repository_access(token.as_ref(), repository_id.into(), Action::Write)
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .is_ok();
+            if !write {
+                authorizer
+                    .check_repository_access(token.as_ref(), repository_id.into(), Action::Label)
+                    .await
+                    .map_err(|_err| no_repository_access_status())?;
+            }
 
             let current_metadata = if !expected.is_zero() {
                 Metadata::deserialize(repository.clone(), expected)
@@ -103,6 +106,15 @@ pub async fn handler(
                         ))
                     })
                 })?;
+
+            if !write
+                && !crate::grpc::handlers::repository_metadata_set::label_only_change(
+                    &current_metadata,
+                    &proposed_metadata,
+                )
+            {
+                return Err(no_repository_access_status());
+            }
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;

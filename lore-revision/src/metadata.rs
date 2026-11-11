@@ -1166,6 +1166,33 @@ impl Metadata {
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
+
+    /// Every stored entry as (key, value, raw type tag), in stored order, including entries
+    /// [`Self::walk`] passes over (unknown tags) and repeated keys. For callers that must compare
+    /// what a reader could see, not only what this build understands.
+    pub fn raw_entries(&self) -> Vec<(&[u8], &[u8], u32)> {
+        let mut entries = Vec::new();
+        let buffer = self.buffer.as_ref();
+        let mut offset = std::mem::size_of::<u32>() * 2;
+        let item_size = std::mem::size_of::<u32>() * 3;
+        while offset + item_size <= buffer.len() {
+            let word = |at: usize| u32::from_ne_bytes(buffer[at..at + 4].try_into().unwrap());
+            let (key_length, value_length, tag) = (
+                word(offset) as usize,
+                word(offset + 4) as usize,
+                word(offset + 8),
+            );
+            offset += item_size;
+            if key_length + value_length > buffer.len() - offset {
+                break;
+            }
+            let key = &buffer[offset..offset + key_length];
+            let value = &buffer[offset + key_length..offset + key_length + value_length];
+            offset += key_length + value_length;
+            entries.push((key, value, tag));
+        }
+        entries
+    }
 }
 
 unsafe impl Send for Metadata {}

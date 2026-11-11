@@ -604,6 +604,24 @@ pub async fn require_action<T>(
     }
 }
 
+/// [`require_action`] satisfied by any one of `actions`.
+pub async fn require_any_action<T>(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    request: &tonic::Request<T>,
+    actions: &[Action],
+) -> Result<(), Status> {
+    let repository = get_repository(request.metadata())?;
+    for action in actions {
+        if authorizer
+            .permits(request.extensions(), repository, *action)
+            .await
+        {
+            return Ok(());
+        }
+    }
+    Err(no_repository_access_status())
+}
+
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
     match request.metadata().get(CORRELATION_ID_HEADER) {
         Some(val) => val.to_str().map(|s| s.to_string()).ok(),
