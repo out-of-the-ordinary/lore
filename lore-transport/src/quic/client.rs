@@ -231,7 +231,7 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
 #[derive(Clone, Copy, Debug)]
 pub enum CongestionAlgorithm {
     Bbr,
-    /// BBRv3 (vendored quinn-proto).
+    /// `BBRv3` (vendored `quinn-proto`).
     Bbr3,
     Cubic,
 }
