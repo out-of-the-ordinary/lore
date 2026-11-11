@@ -327,9 +327,10 @@ impl ParsedStorageRequest {
 
 impl ParsedStorageRequest {
     /// A second action that also satisfies [`Self::required_action`]: a `label`
-    /// grant may upload the blobs a label write needs.
+    /// grant may upload the blobs a label write needs. Not `PutResolved`, which
+    /// writes the mutable store.
     pub fn alternative_action(&self) -> Option<Action> {
-        matches!(self, Self::Put(_) | Self::PutResolved(_)).then_some(Action::Label)
+        matches!(self, Self::Put(_)).then_some(Action::Label)
     }
 }
 

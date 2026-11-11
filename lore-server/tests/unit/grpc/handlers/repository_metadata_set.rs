@@ -221,3 +221,105 @@ async fn write_token_still_sets_any_key() {
         .unwrap()
     );
 }
+
+mod label_only_change {
+    use bytes::Bytes;
+    use lore_revision::metadata::Metadata;
+
+    use super::*;
+
+    const STRING: u32 = lore_revision::metadata::MetadataType::String as u32;
+
+    /// A metadata blob with exactly these (key, value, raw tag) entries, in order, however
+    /// malformed: no setter can express a repeated key or an unknown tag.
+    async fn blob(entries: &[(&str, &str, u32)]) -> Metadata {
+        let (immutable, mutable, execution) = test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repo = Arc::new(RepositoryContext::new_server_context(
+                    immutable,
+                    mutable,
+                    Context::from(REPOSITORY_ID).into(),
+                ));
+                let mut raw = Vec::new();
+                raw.extend_from_slice(&0x6D657461u32.to_ne_bytes());
+                raw.extend_from_slice(&1u32.to_ne_bytes());
+                for (key, value, tag) in entries {
+                    raw.extend_from_slice(&(key.len() as u32).to_ne_bytes());
+                    raw.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+                    raw.extend_from_slice(&tag.to_ne_bytes());
+                    raw.extend_from_slice(key.as_bytes());
+                    raw.extend_from_slice(value.as_bytes());
+                }
+                let address = lore_revision::immutable::write_with_tracker(
+                    repo.clone(),
+                    Context::default(),
+                    Bytes::from(raw),
+                    lore_revision::immutable::write_options_from_repository(repo.clone())
+                        .with_local_cache_priority(),
+                    None,
+                )
+                .await
+                .unwrap();
+                Metadata::deserialize(repo, address.hash).await.unwrap()
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn only_label_entries_changed_is_allowed() {
+        let current = blob(&[("name", "a", STRING), ("label/x", "1", STRING)]).await;
+        let proposed = blob(&[
+            ("name", "a", STRING),
+            ("label/x", "2", STRING),
+            ("label/y", "3", STRING),
+        ])
+        .await;
+        assert!(label_only_change(&current, &proposed));
+        assert!(label_only_change(
+            &Metadata::new(),
+            &proposed_labels().await
+        ));
+    }
+
+    async fn proposed_labels() -> Metadata {
+        blob(&[("label/x", "1", STRING)]).await
+    }
+
+    #[tokio::test]
+    async fn duplicate_keys_are_refused() {
+        let current = blob(&[("name", "a", STRING)]).await;
+        // A reader takes the first `name`, so the diff must not take the last.
+        let proposed = blob(&[("name", "b", STRING), ("name", "a", STRING)]).await;
+        assert!(!label_only_change(&current, &proposed));
+        let proposed = blob(&[
+            ("name", "a", STRING),
+            ("label/x", "1", STRING),
+            ("label/x", "2", STRING),
+        ])
+        .await;
+        assert!(!label_only_change(&current, &proposed));
+    }
+
+    #[tokio::test]
+    async fn unknown_tag_is_refused() {
+        let current = blob(&[("name", "a", STRING)]).await;
+        let proposed = blob(&[("name", "x", 99), ("name", "a", STRING)]).await;
+        assert!(!label_only_change(&current, &proposed));
+        let proposed = blob(&[("name", "a", STRING), ("label/x", "1", 99)]).await;
+        assert!(!label_only_change(&current, &proposed));
+    }
+
+    #[tokio::test]
+    async fn non_label_entry_reordered_changed_added_or_removed_is_refused() {
+        let current = blob(&[("a", "1", STRING), ("b", "2", STRING)]).await;
+        for proposed in [
+            vec![("b", "2", STRING), ("a", "1", STRING)],
+            vec![("a", "1", STRING), ("b", "3", STRING)],
+            vec![("a", "1", STRING), ("b", "2", STRING), ("c", "4", STRING)],
+            vec![("a", "1", STRING)],
+        ] {
+            assert!(!label_only_change(&current, &blob(&proposed).await));
+        }
+    }
+}

@@ -30,22 +30,25 @@ use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
-/// Whether every key that differs between `current` and `proposed` is under `label/`, the only
-/// change a `label` grant permits.
-pub(crate) fn label_only_change(current: &Metadata, proposed: &Metadata) -> bool {
-    let collect = |metadata: &Metadata| {
-        let mut entries = std::collections::HashMap::new();
-        metadata.walk(|key, value, kind| {
-            entries.insert(key.to_vec(), (value.to_vec(), kind));
-        });
+/// Whether `proposed` changes nothing but `label/` entries, the only change a `label` grant
+/// permits. Compares the raw entries, not `walk`, because readers take the first entry for a
+/// key and fail on an unknown tag: `proposed` must have no repeated key and no unknown tag, and
+/// its non-`label/` entries must equal `current`'s byte for byte, in order.
+pub fn label_only_change(current: &Metadata, proposed: &Metadata) -> bool {
+    let proposed = proposed.raw_entries();
+    let mut keys = std::collections::HashSet::new();
+    if !proposed
+        .iter()
+        .all(|(key, _, tag)| MetadataType::try_from(*tag).is_ok() && keys.insert(*key))
+    {
+        return false;
+    }
+    fn unlabeled<'a>(entries: Vec<(&'a [u8], &'a [u8], u32)>) -> Vec<(&'a [u8], &'a [u8], u32)> {
+        let mut entries = entries;
+        entries.retain(|(key, _, _)| !key.starts_with(b"label/"));
         entries
-    };
-    let (current, proposed) = (collect(current), collect(proposed));
-    current
-        .keys()
-        .chain(proposed.keys())
-        .filter(|key| current.get(*key) != proposed.get(*key))
-        .all(|key| key.starts_with(b"label/"))
+    }
+    unlabeled(current.raw_entries()) == unlabeled(proposed)
 }
 
 /// Validate that read-only fields have not been changed between the current and proposed

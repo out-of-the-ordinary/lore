@@ -6,6 +6,7 @@ mod forwarded_repository;
 mod forwarded_requests;
 mod forwarded_revision;
 mod handlers;
+mod label_action;
 mod lock_service;
 mod notification_service;
 mod push_protected;

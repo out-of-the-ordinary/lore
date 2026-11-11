@@ -230,3 +230,37 @@ async fn a_label_token_may_put_but_not_copy() {
         &service.run_request_handler(read_only, put()).await
     ));
 }
+
+/// PutResolved writes the mutable store (a resolve key of the caller's choosing), so `label`
+/// does not cover it.
+#[tokio::test]
+async fn a_label_token_may_not_put_resolved() {
+    use zerocopy::IntoBytes;
+
+    let service = service().await;
+    let repository = random::<RepositoryId>();
+    let (fragment, address, payload) = lore_revision::fragment::generate_random();
+    let mut bytes = lore_base::types::Hash::hash_buffer(b"key")
+        .as_bytes()
+        .to_vec();
+    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(fragment.as_bytes());
+    bytes.extend_from_slice(&payload);
+    let put_resolved = || {
+        ParsedStorageRequest::PutResolved(
+            lore_server::protocol::storage::put_resolved::PutResolved::parse(Bytes::from(
+                bytes.clone(),
+            ))
+            .unwrap(),
+        )
+    };
+
+    let label = connected(repository, &["label"]);
+    assert!(refused(
+        &service.run_request_handler(label, put_resolved()).await
+    ));
+    let write = connected(repository, &["write"]);
+    assert!(!refused(
+        &service.run_request_handler(write, put_resolved()).await
+    ));
+}
