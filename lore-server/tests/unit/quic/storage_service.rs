@@ -231,7 +231,7 @@ async fn a_label_token_may_put_but_not_copy() {
     ));
 }
 
-/// PutResolved writes the mutable store (a resolve key of the caller's choosing), so `label`
+/// `PutResolved` writes the mutable store (a resolve key of the caller's choosing), so `label`
 /// does not cover it.
 #[tokio::test]
 async fn a_label_token_may_not_put_resolved() {
