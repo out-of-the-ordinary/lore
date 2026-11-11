@@ -327,16 +327,29 @@ impl QuicService for StorageServiceV4 {
                 // the per-command check copies nothing. `Some(None)`: the
                 // authorizer could not enumerate, so it is asked below.
                 let action = parsed.required_action();
-                let enumerated = action
-                    .map(|action| session.grants.as_ref().map(|grants| grants.permits(action)));
+                let alternative = parsed.alternative_action();
+                let enumerated = action.map(|action| {
+                    session.grants.as_ref().map(|grants| {
+                        grants.permits(action)
+                            || alternative.is_some_and(|alternative| grants.permits(alternative))
+                    })
+                });
                 drop(session);
                 let permitted = match (action, enumerated) {
                     (Some(action), Some(None)) => {
                         let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
-                        self.repository_authorizer
+                        let authorizer = &self.repository_authorizer;
+                        let mut permitted = authorizer
                             .check_repository_access(verified.as_ref(), repository, action)
                             .await
-                            .is_ok()
+                            .is_ok();
+                        if let (false, Some(alternative)) = (permitted, alternative) {
+                            permitted = authorizer
+                                .check_repository_access(verified.as_ref(), repository, alternative)
+                                .await
+                                .is_ok();
+                        }
+                        permitted
                     }
                     (_, Some(Some(permitted))) => permitted,
                     _ => true,

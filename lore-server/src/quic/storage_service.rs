@@ -325,6 +325,14 @@ impl ParsedStorageRequest {
     }
 }
 
+impl ParsedStorageRequest {
+    /// A second action that also satisfies [`Self::required_action`]: a `label`
+    /// grant may upload the blobs a label write needs.
+    pub fn alternative_action(&self) -> Option<Action> {
+        matches!(self, Self::Put(_) | Self::PutResolved(_)).then_some(Action::Label)
+    }
+}
+
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
     match message_error {
         MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
@@ -520,6 +528,14 @@ impl QuicService for StorageService {
         if let Some(action) = request.required_action()
             && connection_permits(&context, self.repository_authorizer.as_ref(), action).await
                 == Some(false)
+            && match request.alternative_action() {
+                Some(alternative) => {
+                    connection_permits(&context, self.repository_authorizer.as_ref(), alternative)
+                        .await
+                        == Some(false)
+                }
+                None => true,
+            }
         {
             return Err(MessageHandleError::AuthorizationFailure(
                 "Action not permitted".to_string(),

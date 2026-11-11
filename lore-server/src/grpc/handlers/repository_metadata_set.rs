@@ -30,6 +30,24 @@ use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
+/// Whether every key that differs between `current` and `proposed` is under `label/`, the only
+/// change a `label` grant permits.
+pub(crate) fn label_only_change(current: &Metadata, proposed: &Metadata) -> bool {
+    let collect = |metadata: &Metadata| {
+        let mut entries = std::collections::HashMap::new();
+        metadata.walk(|key, value, kind| {
+            entries.insert(key.to_vec(), (value.to_vec(), kind));
+        });
+        entries
+    };
+    let (current, proposed) = (collect(current), collect(proposed));
+    current
+        .keys()
+        .chain(proposed.keys())
+        .filter(|key| current.get(*key) != proposed.get(*key))
+        .all(|key| key.starts_with(b"label/"))
+}
+
 /// Validate that read-only fields have not been changed between the current and proposed
 /// metadata blobs.
 fn validate_read_only_fields(current: &Metadata, proposed: &Metadata) -> Result<(), Status> {
@@ -117,14 +135,17 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            authorizer
-                .check_repository_access(
-                    get_verified_token(&extensions).as_ref(),
-                    repository_id.into(),
-                    Action::Write,
-                )
+            let token = get_verified_token(&extensions);
+            let write = authorizer
+                .check_repository_access(token.as_ref(), repository_id.into(), Action::Write)
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .is_ok();
+            if !write {
+                authorizer
+                    .check_repository_access(token.as_ref(), repository_id.into(), Action::Label)
+                    .await
+                    .map_err(|_err| no_repository_access_status())?;
+            }
 
             // Deserialize current and proposed blobs for validation
             let current_metadata = if !expected_hash.is_zero() {
@@ -152,6 +173,11 @@ pub async fn handler(
                         ))
                     })
                 })?;
+
+            // A `label` grant without `write` may only change `label/` keys
+            if !write && !label_only_change(&current_metadata, &proposed_metadata) {
+                return Err(no_repository_access_status());
+            }
 
             // Validate read-only fields are unchanged
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;

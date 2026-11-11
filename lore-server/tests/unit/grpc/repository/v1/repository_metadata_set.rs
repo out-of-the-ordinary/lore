@@ -285,3 +285,102 @@ mod validate_read_only_fields {
         assert!(err.message().contains(repository::CREATED));
     }
 }
+
+mod label_action {
+    const REPOSITORY_ID: [u8; 16] = [1u8; 16];
+    use lore_base::types::Context;
+    use lore_base::types::RepositoryId;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::grpc::repository::v1::repository_metadata_set::*;
+    use tonic::Code;
+
+    use super::*;
+    use crate::store::test_support::test_store_create;
+
+    /// Permits only what a `label` token holds: read and label.
+    struct LabelOnlyAuthorizer;
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for LabelOnlyAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            action: Action,
+        ) -> Result<(), Status> {
+            match action {
+                Action::Read | Action::Label => Ok(()),
+                _ => Err(Status::permission_denied("denied")),
+            }
+        }
+    }
+
+    async fn set_with(
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        keys: &[&str],
+    ) -> Result<bool, Status> {
+        let (immutable, mutable, execution) = test_store_create().await.unwrap();
+        let keys = keys.to_vec();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repo_ctx = Arc::new(RepositoryContext::new_server_context(
+                    immutable.clone(),
+                    mutable.clone(),
+                    Context::from(REPOSITORY_ID).into(),
+                ));
+                let mut metadata = Metadata::new();
+                for key in keys {
+                    metadata.set_string(key, "value").unwrap();
+                }
+                let hash = metadata.serialize(repo_ctx).await.unwrap();
+                let request = Request::new(RepositoryMetadataSetRequest {
+                    id: REPOSITORY_ID.to_vec().into(),
+                    expected: vec![0u8; 32].into(),
+                    updated: hash.into(),
+                });
+                handler(request, authorizer, immutable, mutable)
+                    .await
+                    .map(|response| {
+                        lore_base::types::Hash::from(response.into_inner().metadata) == hash
+                    })
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn label_token_sets_label_key() {
+        assert!(
+            set_with(Arc::new(LabelOnlyAuthorizer), &["label/Android_1.0.1"])
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn label_token_refused_for_other_key() {
+        let err = set_with(Arc::new(LabelOnlyAuthorizer), &["description"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn label_token_refused_for_mixed_keys() {
+        let err = set_with(Arc::new(LabelOnlyAuthorizer), &["label/x", "description"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn write_token_still_sets_any_key() {
+        assert!(
+            set_with(
+                Arc::new(AllowAllRepositoryAuthorizer),
+                &["label/x", "description"]
+            )
+            .await
+            .unwrap()
+        );
+    }
+}
