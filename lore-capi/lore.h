@@ -1174,6 +1174,10 @@ typedef struct lore_branch_push_event_data_t {
 
 // Data for the event sent before a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision being updated.
   struct lore_hash_t revision;
   // The previous parent revision.
@@ -1184,12 +1188,20 @@ typedef struct lore_branch_push_revision_update_begin_event_data_t {
 
 // Data for the event sent after a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The updated revision.
   struct lore_hash_t revision;
 } lore_branch_push_revision_update_end_event_data_t;
 
 // Data for the event sent before fragments are transferred during push.
 typedef struct lore_branch_push_fragment_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments to transfer.
   uint64_t fragments;
   // The total number of bytes to transfer.
@@ -1198,6 +1210,10 @@ typedef struct lore_branch_push_fragment_begin_event_data_t {
 
 // Data for the event sent as fragments are transferred during push.
 typedef struct lore_branch_push_fragment_progress_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred so far.
   uint64_t complete;
   // The total number of fragments to transfer.
@@ -1210,6 +1226,10 @@ typedef struct lore_branch_push_fragment_progress_event_data_t {
 
 // Data for the event sent after fragments are transferred during push.
 typedef struct lore_branch_push_fragment_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred.
   uint64_t fragments;
   // The number of bytes transferred.
@@ -1228,6 +1248,10 @@ typedef struct lore_branch_push_branch_create_begin_event_data_t {
 
 // Data for the event sent after a branch is created on the remote.
 typedef struct lore_branch_push_branch_create_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision the branch points to on the remote.
   struct lore_hash_t remote_revision;
 } lore_branch_push_branch_create_end_event_data_t;
@@ -1246,6 +1270,10 @@ typedef struct lore_branch_push_revision_push_begin_event_data_t {
 
 // Data for the event sent when the remote assigns a pushed revision a new identity.
 typedef struct lore_branch_push_revision_push_update_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision before the remote reassigned it.
   struct lore_hash_t old_revision;
   // The revision the remote assigned.
@@ -1618,7 +1646,7 @@ typedef struct lore_file_unstage_begin_event_data_t {
 
 // Running counts of items processed during an unstage operation.
 typedef struct lore_file_unstage_count_data_t {
-  // Number of directories that were unstaged.
+  // Number of directories and links that were unstaged.
   uint64_t directory_unstaged_count;
   // Number of directories that were discarded.
   uint64_t directory_discarded_count;
@@ -3348,7 +3376,7 @@ typedef struct lore_revision_commit_stats_event_data_t {
 // Emitted once, when the push finishes, at statistics level one and above. A
 // push that failed reports what it had done by then. The counts are cumulative
 // across every revision, link and layer the push registers, where
-// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+// `lore_branch_push_fragment_progress_event_data_t` reports one revision's share.
 //
 // A push stores no payload of its own: a fragment the peer was asked about is
 // deduplicated, copied or put, unless the push ended before it was reached.
@@ -4352,9 +4380,9 @@ typedef struct lore_global_args_t {
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
-  // Cache fragment payloads fetched from remote in the local store. Without
-  // this only state fragments and fragments flagged for local cache priority
-  // are retained
+  // Cache fragment payloads fetched from remote, and those written, in the local store, as
+  // a repository's `[store] cache_payloads` does for every command. Without either only state
+  // fragments and fragments flagged for local cache priority are retained
   uint8_t cache;
   // Authentication token to use instead of the one held in the secure token
   // store. Authorization tokens are exchanged from it as they are needed.
@@ -5095,7 +5123,8 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
   uint8_t no_tracking;
-  // Root files for dependency-based selective clone
+  // Root files for dependency-based selective clone. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -5365,7 +5394,8 @@ typedef struct lore_revision_sync_args_t {
   uint8_t forward_changes;
   // Reset local modified files to match the incoming revision
   uint8_t reset;
-  // Root files for dependency-based selective sync
+  // Root files for dependency-based selective sync. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -9111,6 +9141,8 @@ void lore_file_dump_async(const struct lore_global_args_t *globals,
 
 // Adds dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9159,6 +9191,8 @@ void lore_file_dependency_add_async(const struct lore_global_args_t *globals,
 
 // Removes dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9206,6 +9240,8 @@ void lore_file_dependency_remove_async(const struct lore_global_args_t *globals,
                                        struct lore_event_callback_config_t callback);
 
 // Queries dependency information for files.
+//
+// Fails with error code 9 (not supported) when a path is inside a link.
 //
 // # Events
 //

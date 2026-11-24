@@ -32,9 +32,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
-use super::load_repository_config_from_dot_dir;
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::dependency;
 use crate::errors::*;
 use crate::event;
@@ -1028,10 +1026,7 @@ pub async fn clone(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        let existing_repository_is_swfs =
-            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.vfs_type() == VfsType::Swfs);
-        if call.force() && !existing_repository_is_swfs {
+        if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             // A dry run could not set up the clone without replacing the repository it would
             // only report on, and a repository it removed cannot be restored afterwards.
             if call.dry_run() {
@@ -1565,16 +1560,9 @@ fn store_cloned_branch(
             let local_latest = branch::load_latest(repository.clone(), branch_id)
                 .await
                 .unwrap_or_default();
-            branch::store_latest(
-                repository.clone(),
-                branch_id,
-                local_latest,
-                revision,
-                BranchLatestStatus::Convergent,
-            )
-            .await
-            .forward::<CloneError>("Failed to create local branch")?;
-            branch::store_last_sync(repository, branch_id, revision).await;
+            branch::store_synced_latest(&repository, branch_id, local_latest, revision)
+                .await
+                .forward::<CloneError>("Failed to create local branch")?;
         }
         Ok(())
     }
@@ -1611,21 +1599,21 @@ fn refuse_on_held_state(
     Err(hold::refused("restrict a clone to a dependency set").into())
 }
 
-/// The short-circuit `clone_materialize` takes when the provider holds its state in a `State`
-/// ([`InstanceOperationImpl::holds_state`]): hands it `ctx.state` to hold
-/// ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does not exist, then
-/// starts the background prefetch that `ctx.options` asks for and returns without waiting for
-/// it. The provider loads whatever the prefetch has not yet warmed on demand.
+/// Hands a provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`])
+/// `ctx.state` to hold ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does
+/// not exist, then starts the background prefetch that `ctx.options` asks for and returns without
+/// waiting for it, answering whether it held. The provider loads whatever the prefetch has not
+/// yet warmed on demand.
 ///
 /// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
 /// so does a dry run.
 #[lore_macro::test_pub]
-async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<bool, CloneError> {
     if ctx.options.bare || ctx.state.revision().is_zero() {
-        return Ok(());
+        return Ok(false);
     }
     if execution_context().globals().dry_run() {
-        return Ok(());
+        return Ok(false);
     }
     ctx.operation
         .hold_state(
@@ -1639,7 +1627,7 @@ async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
     if !plan.is_empty() {
         ctx.operation.start_prefetch(plan);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Caches `state`'s own records, and with `file_metadata` its file metadata blocks, in a task of
@@ -1652,6 +1640,23 @@ fn spawn_fragment_cache(
     let repository = repository.clone();
     let state = state.clone();
     lore_spawn!(async move { state.cache_fragments(repository, file_metadata).await })
+}
+
+/// Clones onto a provider that holds its state in a `State`: [`clone_materialize_hold`], then,
+/// where it held, caches the state's records ([`spawn_fragment_cache`]), so the state reads and
+/// commits offline, and reads the held ignore file into the store meanwhile
+/// ([`InstanceOperationImpl::warm_held_ignore_file`]). Answers the caching task.
+#[lore_macro::test_pub]
+async fn clone_onto_held_state(
+    ctx: &CloneContext,
+) -> Result<Option<tokio::task::JoinHandle<Result<(), crate::state::StateError>>>, CloneError> {
+    if !clone_materialize_hold(ctx).await? {
+        return Ok(None);
+    }
+    let cache_task =
+        spawn_fragment_cache(&ctx.repository, &ctx.state, ctx.options.cache_file_metadata);
+    ctx.operation.warm_held_ignore_file().await;
+    Ok(Some(cache_task))
 }
 
 /// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
@@ -1674,17 +1679,7 @@ async fn clone_materialize(
     let mut cache_task = None;
 
     if ctx.operation.holds_state() {
-        clone_materialize_hold(&ctx).await?;
-        // The tree loads on demand, but the state's own records, and the file metadata blocks
-        // where asked, are made local as an ordinary clone makes them, so the state reads and
-        // commits offline.
-        if !options.bare && !revision.is_zero() {
-            cache_task = Some(spawn_fragment_cache(
-                &repository,
-                &state,
-                options.cache_file_metadata,
-            ));
-        }
+        cache_task = clone_onto_held_state(&ctx).await?;
     } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
@@ -1789,25 +1784,12 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             visited: DashSet::new(),
         });
 
-        event::LoreEvent::DependencyResolveBegin(dependency::LoreDependencyResolveBeginEventData {
-            root_count: options.root_files.len() as u64,
-        })
-        .send();
-
-        for root_path in &options.root_files {
-            let relative = RelativePath::new_from_initial_path(root_path)
-                .forward_with::<CloneError, _>(|| format!("Invalid path: {root_path}"))?;
-            let repository_path = relative;
-            let node_link = state
-                .find_node_link(repository.clone(), repository_path.as_str())
+        let roots =
+            dependency::resolve::resolve_root_nodes(&repository, &state, &options.root_files)
                 .await
-                .forward_with::<CloneError, _>(|| format!("Root file not found: {root_path}"))?;
-            if !node_link.is_valid() {
-                return Err(CloneError::internal(format!(
-                    "Root file not found: {root_path}"
-                )));
-            }
-            let node_id = node_link.node;
+                .forward::<CloneError>("Resolving the root files")?;
+
+        for (_, repository_path) in &roots {
             let parent = repository_path.parent_path();
             if !parent.is_empty() {
                 ctx.operation
@@ -1815,6 +1797,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                     .await
                     .forward::<CloneError>("Failed to root path parent directory")?;
             }
+        }
+        for (node_id, repository_path) in roots {
             dep_ctx.visited.insert(node_id);
             dispatcher.dispatch(BlockDiscoverItem {
                 node_id,

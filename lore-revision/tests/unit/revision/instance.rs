@@ -33,10 +33,14 @@ use lore_revision::repository;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::revision::sync;
+use lore_revision::revision::sync::SyncError;
+use lore_revision::revision::sync::SyncOptions;
 use lore_revision::stage::StageCaseChange;
 use lore_revision::stage::StageOptions;
 use lore_revision::state::State;
 
+use crate::helper::create_branch_on_instance;
 use crate::helper::test_file_write;
 use crate::helper::test_store_create;
 
@@ -191,6 +195,9 @@ pub(super) enum Edit {
     Write(&'static str, &'static str),
     /// Deletes the file or the directory at the path.
     Delete(&'static str),
+    /// Gives the file at the path the executable bit, or takes it away.
+    #[cfg(unix)]
+    Chmod(&'static str, bool),
 }
 
 /// Makes `edits` in the working tree, stages each move as one, and commits them, answering the
@@ -224,6 +231,16 @@ pub(super) async fn commit_edits(instance: &Instance, edits: &[Edit], message: &
                     std::fs::remove_file(absolute).expect("Failed to delete");
                 }
             }
+            #[cfg(unix)]
+            Edit::Chmod(path, executable) => {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if executable { 0o755 } else { 0o644 };
+                std::fs::set_permissions(
+                    instance.path.join(path),
+                    std::fs::Permissions::from_mode(mode),
+                )
+                .expect("Failed to change the mode");
+            }
         }
     }
     stage_and_commit(instance, &instance.path, message).await
@@ -247,16 +264,9 @@ pub(super) async fn switch_to(instance: &Instance, branch: &str) {
 }
 
 pub(super) async fn create_branch(instance: &Instance, name: &str) {
-    branch::create::create(
-        instance.repository.clone(),
-        &instance.write_token,
-        name.to_string(),
-        None,
-        String::new(),
-        false,
-    )
-    .await
-    .expect("Failed to create the branch");
+    create_branch_on_instance(&instance.repository, name, None, "", false)
+        .await
+        .expect("Failed to create the branch");
 }
 
 pub(super) async fn current(instance: &Instance) -> Hash {
@@ -281,8 +291,31 @@ pub(super) async fn merge_branch(instance: &Instance, name: &str) -> bool {
     current(instance).await != before
 }
 
+/// Syncs the instance to `revision`, answering what the sync answers.
+pub(super) async fn sync_to(instance: &Instance, revision: Hash) -> Result<(), SyncError> {
+    sync::sync_boxed(
+        instance.repository.clone(),
+        &instance.write_token,
+        SyncOptions {
+            revision: Some(revision.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Merges branch `name` into the current one, answering what the merge answers.
 pub(super) async fn try_merge_branch(instance: &Instance, name: &str) -> Result<Hash, MergeError> {
+    start_merge(instance, name, false).await
+}
+
+/// Merges branch `name` into the current one, committing the merge unless `no_commit` asks to
+/// leave it staged, and answers what the merge answers.
+pub(super) async fn start_merge(
+    instance: &Instance,
+    name: &str,
+    no_commit: bool,
+) -> Result<Hash, MergeError> {
     let source = branch::resolve(instance.repository.clone(), name)
         .await
         .expect("Failed to resolve the branch to merge")
@@ -294,7 +327,7 @@ pub(super) async fn try_merge_branch(instance: &Instance, name: &str) -> Result<
         branch::merge::MergeStartOptions {
             message: "Merge".to_string(),
             link_messages: std::collections::HashMap::new(),
-            no_commit: false,
+            no_commit,
             scope: branch::merge::MergeScope::MainOnly,
             inherit_metadata: MetadataInherit::default(),
         },

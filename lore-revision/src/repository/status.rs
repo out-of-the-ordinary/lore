@@ -785,32 +785,36 @@ async fn report_staged_changes(
 /// Asked of the drawn subtree rather than the whole state, the same way `layer::list_staged`
 /// counts, because everything outside it belongs to the drawn-from repository and not the layer.
 /// Dirty flags propagate to a node's parents and clearing one propagates the clear back up, so
-/// the source node's children answer for the whole subtree. On any error the answer is "holds
-/// staging": dropping a pin on a question that could not be answered loses staged work.
+/// the source node's children answer for the whole subtree. They are read in the state holding
+/// the source node, a linked one where the source path crosses a link. On any error the answer is
+/// "holds staging": dropping a pin on a question that could not be answered loses staged work.
+#[lore_macro::test_pub]
 async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerState) -> bool {
-    let state = &layer_state.state_staged;
-    let repository = &layer_state.repository;
-
-    let Ok(source_node_link) = state
-        .find_node_link(repository.clone(), &layer.source_path)
+    let Ok((source, (repository, state))) = layer_state
+        .state_staged
+        .find_relative_held(
+            layer_state.repository.clone(),
+            ROOT_NODE,
+            &layer.source_path,
+        )
         .await
     else {
         return true;
     };
-    let source_node = source_node_link.node;
-    if !source_node.is_valid_or_root_node_id() {
+    if !source.node.is_valid_or_root_node_id() {
         return true;
     }
 
     if state
-        .node_has_dirty_children(repository.clone(), source_node)
+        .node_has_dirty_children(repository.clone(), source.node)
         .await
         .unwrap_or(true)
     {
         return true;
     }
 
-    state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
+    let staged = state::count_staged_files(repository, state, source.node).await;
+    staged.count > 0 || !staged.complete
 }
 
 /// Persist the markers `--check-dirty` cleared in the linked states `pending` names, for the links
@@ -911,7 +915,7 @@ async fn report_repository_staged_diff(
         repository.clone(),
         state_staged,
         path,
-        FilterMode::TRACKED,
+        FilterMode::CHANGES,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;
@@ -943,7 +947,7 @@ async fn report_layer_staged_diff(
         )
         .await,
         selection.mount_path.clone(),
-        FilterMode::TRACKED,
+        FilterMode::CHANGES,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;
@@ -1493,7 +1497,8 @@ struct ScanTarget {
     /// The path, or `None` for the whole repository.
     path: Option<RelativePath>,
     /// Whether its scan creates the directory nodes above it that the tree lacks: only the
-    /// working tree holds the path, and the filter keeps it.
+    /// working tree holds the path, the filter keeps it, and the deepest node the tree holds on
+    /// it is a directory, short of any link.
     creates_ancestors: bool,
 }
 
@@ -1581,10 +1586,33 @@ fn resolve_scan_target(
     report_ignored: bool,
 ) -> impl Future<Output = Option<ScanTarget>> + Send {
     async move {
-        let tracked = state
-            .find_node_link(repository.clone(), path.as_str())
+        let (tracked, missing_below) = match state
+            .find_to_link(&repository, ROOT_NODE, path.as_str(), false)
             .await
-            .is_ok_and(|node_link| node_link.is_valid());
+        {
+            Ok(state::PathStop {
+                at: state::Stop::End,
+                ..
+            }) => (true, None),
+            Ok(
+                stop @ state::PathStop {
+                    at: state::Stop::Link(_),
+                    ..
+                },
+            ) => (
+                state
+                    .find_relative_from(repository.clone(), path.as_str(), stop)
+                    .await
+                    .is_ok_and(|(node_link, _)| node_link.is_valid()),
+                None,
+            ),
+            Ok(state::PathStop {
+                at: state::Stop::Missing,
+                node,
+                ..
+            }) => (false, Some(node)),
+            Err(_) => (false, None),
+        };
         if tracked {
             return Some(ScanTarget {
                 path: Some(path),
@@ -1613,9 +1641,20 @@ fn resolve_scan_target(
             info.is_some_and(|info| info.is_dir()),
             FilterMode::Full,
         );
+        // The directories leading to a path below a link mount belong to the linked tree, where
+        // its own scan adds them, and none is added below a file. A path that cannot be read
+        // through is left to its own scan too, which fails on it as this would.
+        let creates_ancestors = !excluded
+            && match missing_below {
+                Some(node) => state
+                    .node(repository.clone(), node)
+                    .await
+                    .is_ok_and(|node| node.is_directory()),
+                None => false,
+            };
         Some(ScanTarget {
             path: Some(path),
-            creates_ancestors: !excluded,
+            creates_ancestors,
         })
     }
 }

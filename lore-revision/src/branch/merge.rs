@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use crate::find;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreEvent;
@@ -462,7 +464,9 @@ struct MergeSource {
     current_signature: Hash,
 }
 
-/// `current` is the revision the merge starts from, at the path the working tree holds it.
+/// Merges the latest of `source_branch` into `current_signature` on `current_branch`, checked
+/// against the working tree, and stages the result. `current` is the revision the merge starts
+/// from, at the path the working tree holds it.
 #[allow(clippy::too_many_arguments)]
 async fn merge_repository(
     repository: Arc<RepositoryContext>,
@@ -673,13 +677,15 @@ async fn check_merge(
             MergeType::BranchMerge,
         )
         .await?;
-        // Applying checks again where it writes; clearing `LocalMode` lets that check settle it
-        // afresh.
+        // Applying checks again where it writes; clearing what this check found lets that check
+        // settle it afresh.
         for change in changes
             .iter_mut()
             .chain(conflicts.iter_mut().map(|(_, change_to)| change_to))
         {
-            change.flags.remove(change::Flags::LocalMode);
+            change
+                .flags
+                .remove(change::Flags::LocalMode | change::Flags::HoldsContent);
         }
         Ok::<_, MergeError>(())
     })
@@ -1193,13 +1199,16 @@ struct PlannedLinkMerge<'a> {
 /// will be applied to the parent's staged state in a subsequent step.
 struct MergedLink {
     link_path: String,
-    /// Cached `RelativePath` form of `link_path` so the post-loop blocks
-    /// don't re-parse it for every `stage_link_pin` call.
+    /// `link_path` as a `RelativePath`, which `finalize_link_conflict_state` stages the pin at.
+    /// `finalize_main_merge` stages it at the path `link::merged_link_path` resolves instead.
     link_path_rel: RelativePath,
     link_node: Node,
     link_context: Arc<RepositoryContext>,
     link_reference: state::LinkReference,
     new_signature: Hash,
+    /// Whether staging the pin realizes it in the working tree. A link merged on an earlier pass
+    /// of the merge is already realized there, with the resolutions made since on top.
+    realize: link::LinkPinRealize,
 }
 
 /// Inputs captured for a link merge that produced conflicts so the caller can
@@ -1428,13 +1437,50 @@ async fn seed_resumed_merged_links(
             link_path_rel,
             link_node,
             link_context,
-            // `stage_link_pin` is told the old signature so it can realize
-            // the file-system delta — use the entry's recorded base.
+            // `stage_link_pin` reads the mounted path at the old signature,
+            // so it is told the entry's recorded base.
             link_reference: entry.base,
             new_signature: staged_ref.signature,
+            realize: link::LinkPinRealize::StateOnly,
         });
     }
     Ok(merged_links)
+}
+
+/// Reports each conflict left unresolved inside `merged_links`, the links merged on an earlier pass
+/// of the merge, and returns whether there is one.
+async fn report_unresolved_link_conflicts(merged_links: &[MergedLink]) -> Result<bool, MergeError> {
+    let unresolved = link::try_join_links(
+        merged_links
+            .iter()
+            .map(async |merged| {
+                let link_state =
+                    state::State::deserialize(merged.link_context.clone(), merged.new_signature)
+                        .await
+                        .forward::<MergeError>("deserializing resumed link state")?;
+                stage::collect_merge_paths(
+                    merged.link_context.clone(),
+                    link_state,
+                    merged.link_node.child,
+                    merged.link_path_rel.clone(),
+                    UNRESOLVED_CONFLICTS,
+                    None,
+                )
+                .await
+                .forward::<MergeError>("collecting the resumed link's conflicted paths")
+            })
+            .collect(),
+    )
+    .await?;
+    let mut any = false;
+    for path in unresolved.into_iter().flat_map(|collected| collected.files) {
+        any = true;
+        event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
+            path: LoreString::from(path.as_str()),
+        })
+        .send();
+    }
+    Ok(any)
 }
 
 /// Merge all eligible linked repositories, then the main repository
@@ -1442,10 +1488,11 @@ async fn seed_resumed_merged_links(
 ///
 /// Reads top-down: enumerate eligible links, load existing
 /// `LinkMergeState` for resume detection, seed `merged_links` for any
-/// already-merged entries, check the merge of each remaining eligible link
-/// and of the main repository against the working copy, write each link's
-/// merge in turn, and finalize either as a merge-in-conflict (if any link
-/// conflicted) or by writing the main repository's merge.
+/// already-merged entries, check the main repository's merge against the
+/// working tree, skip the links its diff removes, check the merge of each remaining
+/// eligible link, write each link's merge in turn, and finalize either as a
+/// merge-in-conflict (if any link conflicted) or by writing the main
+/// repository's merge.
 async fn merge_start_all(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1471,8 +1518,26 @@ async fn merge_start_all(
 
     let mut merged_links =
         seed_resumed_merged_links(&repository, &state_staged_opt, &link_merge_entries).await?;
+    if let Some(state_staged) = &state_staged_opt
+        && report_unresolved_link_conflicts(&merged_links).await?
+    {
+        return Ok(state_staged.revision());
+    }
     let mut has_link_conflicts = false;
     let mut pending_conflict_realizes: Vec<PendingConflictRealize> = Vec::new();
+
+    // The main repository's merge starts from `state_current` whatever the links' merges
+    // write, so it is checked here, before any of theirs is written, and its diff decides which
+    // links the merge removes.
+    let main_merge = check_merge(
+        &repository,
+        branch,
+        current_branch,
+        state_current.revision(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
+    )
+    .await?;
+    let removed_links = links_the_merge_removes(&main_merge, &eligible_links);
 
     let mut planned_links = Vec::new();
     for eligible in &eligible_links {
@@ -1483,6 +1548,14 @@ async fn merge_start_all(
         {
             lore_debug!(
                 "Resuming: skipping already-merged link at {}",
+                eligible.link_path
+            );
+            continue;
+        }
+
+        if removed_links.contains(&eligible.link_reference.local_node) {
+            lore_info!(
+                "Skipping link at {}, which the merged branch removes",
                 eligible.link_path
             );
             continue;
@@ -1578,16 +1651,6 @@ async fn merge_start_all(
         });
     }
 
-    // The main repository's merge starts from `state_current` whatever the links' merges
-    // write, so it is checked here, before any of theirs is written.
-    let main_merge = check_merge(
-        &repository,
-        branch,
-        current_branch,
-        state_current.revision(),
-        NodeMapping::root(repository.clone(), state_current.clone()),
-    )
-    .await?;
     let merged_nodes: Vec<NodeID> = merged_links
         .iter()
         .map(|merged| merged.link_reference.local_node)
@@ -1656,6 +1719,7 @@ async fn merge_start_all(
                 link_context: eligible.link_context.clone(),
                 link_reference: eligible.link_reference,
                 new_signature: result.signature,
+                realize: link::LinkPinRealize::WorkingTree,
             });
 
             // Atomicity checkpoint: persist `link_merge_entries` onto a
@@ -1690,7 +1754,8 @@ async fn merge_start_all(
 
     // If any link merge produced file conflicts, finalise the parent state as
     // a merge in conflict and stop. Main's merge cannot run safely against an
-    // unresolved link state.
+    // unresolved link state, which is why a resumed merge stops above while a
+    // link merged on an earlier pass still holds conflicts.
     if has_link_conflicts && !dry_run {
         let signature = finalize_link_conflict_state(
             &repository,
@@ -1717,6 +1782,25 @@ async fn merge_start_all(
         dry_run,
     ))
     .await
+}
+
+/// The nodes of the links among `eligible` whose node `main_merge`'s diff deletes, as
+/// [`link::merge_deletes_link`] decides it.
+fn links_the_merge_removes(
+    main_merge: &PreparedMerge,
+    eligible: &[EligibleLink],
+) -> HashSet<NodeID> {
+    eligible
+        .iter()
+        .filter(|link| {
+            link::merge_deletes_link(
+                &main_merge.diff.changes,
+                &link.link_path,
+                link.link_context.id,
+            )
+        })
+        .map(|link| link.link_reference.local_node)
+        .collect()
 }
 
 /// Finalize the parent staged state when at least one linked merge produced
@@ -1749,7 +1833,7 @@ async fn finalize_link_conflict_state(
             merged.new_signature,
             merged.link_reference.branch,
             link::LinkMountSource::SamePath,
-            link::LinkPinRealize::WorkingTree,
+            merged.realize,
         )
         .await
         .forward_with::<MergeError, _>(|| {
@@ -1814,12 +1898,19 @@ async fn finalize_link_conflict_state(
 
 /// Finalize the parent merge: apply `main_merge`, apply collected link pin
 /// updates to its staged state, persist, and auto-commit if no conflicts.
+///
+/// A link merged in its own right takes the pin its merge produced where the merged state holds
+/// its node, at the path a move of the node, as a rename in case, or of a directory above it
+/// carries it to; the pin of one the merge removes or replaces is dropped. Among those is a link
+/// removed inside an out-of-view subtree the merge adopts whole, which the diff sets apart: its
+/// repository is merged first, and that merge is left out here. A per-link message for a link the
+/// merge removes is left out of the commit the merge makes.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_main_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     branch: BranchId,
-    options: MergeStartOptions,
+    mut options: MergeStartOptions,
     state_current: Arc<State>,
     current_branch: BranchId,
     main_merge: PreparedMerge,
@@ -1841,19 +1932,46 @@ async fn finalize_main_merge(
     )
     .await?;
 
-    if !dry_run {
-        for merged in merged_links {
+    let staged_links = link::LinkRows::read(&state_staged, repository.clone())
+        .await
+        .forward::<MergeError>("listing the merged links")?;
+    let mut merged_nodes: Vec<NodeID> = Vec::with_capacity(merged_links.len());
+    let mut left_out: HashSet<NodeID> = HashSet::new();
+    for merged in merged_links {
+        let link_path = link::merged_link_path(
+            &repository,
+            &staged_links,
+            merged.link_reference.local_node,
+            merged.link_context.id,
+            merged.link_reference.resolve_branch(current_branch),
+            current_branch,
+        )
+        .await
+        .forward_with::<MergeError, _>(|| {
+            format!("locating the merged link {}", merged.link_path)
+        })?;
+        let Some(link_path) = link_path else {
+            lore_info!(
+                "The merge removes or replaces link {}, which leaves out the merge of its \
+                 repository",
+                merged.link_path
+            );
+            left_out.insert(merged.link_reference.local_node);
+            continue;
+        };
+        merged_nodes.push(merged.link_reference.local_node);
+        if !dry_run {
             link::stage_link_pin(
                 repository.clone(),
                 &state_staged,
                 &merged.link_context,
-                merged.link_path_rel.clone(),
+                link_path,
                 merged.link_node,
                 merged.link_reference.signature,
                 merged.new_signature,
                 merged.link_reference.branch,
                 link::LinkMountSource::SamePath,
-                link::LinkPinRealize::WorkingTree,
+                merged.realize,
             )
             .await
             .forward_with::<MergeError, _>(|| {
@@ -1861,14 +1979,17 @@ async fn finalize_main_merge(
             })?;
         }
     }
+    // A link the merge removes or replaces keeps no row for the link merge state to restore it
+    // through, and the parent's abort restores it.
+    let link_merge_entries: Vec<LinkMergeEntry> = link_merge_entries
+        .iter()
+        .filter(|entry| !left_out.contains(&entry.local_node))
+        .copied()
+        .collect();
 
     // Links merged above already carry the pin their own merge produced. The
     // comparison runs on a dry run too, so `--dry-run` reports a row the real
     // merge would refuse.
-    let merged_nodes: Vec<NodeID> = merged_links
-        .iter()
-        .map(|merged| merged.link_reference.local_node)
-        .collect();
     let state_base = state::State::deserialize(repository.clone(), endpoints.base)
         .await
         .forward::<MergeError>("deserializing diff base state")?;
@@ -1897,7 +2018,7 @@ async fn finalize_main_merge(
 
         if !link_merge_entries.is_empty() {
             state_staged
-                .serialize_link_merge_state(repository.clone(), link_merge_entries)
+                .serialize_link_merge_state(repository.clone(), &link_merge_entries)
                 .await
                 .forward::<MergeError>("serializing link merge state")?;
         }
@@ -1924,10 +2045,39 @@ async fn finalize_main_merge(
     }
 
     if !has_conflicts && !dry_run && !options.no_commit {
+        if !options.link_messages.is_empty() {
+            Box::pin(leave_out_messages_of_links_gone(
+                &repository,
+                &state_staged,
+                &mut options.link_messages,
+            ))
+            .await?;
+        }
         return auto_commit_merge(repository, token, options).await;
     }
 
     Ok(state_staged.revision())
+}
+
+/// Leaves out of `link_messages` each message whose path `state_staged`, the merge's result,
+/// holds no link at, as for a link the merge removes, which the commit the merge makes would
+/// refuse. A cold path its caller boxes, taken only where per-link messages were given.
+async fn leave_out_messages_of_links_gone(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    link_messages: &mut std::collections::HashMap<String, String>,
+) -> Result<(), MergeError> {
+    for (path, message) in std::mem::take(link_messages) {
+        if link::holds_link_at(state_staged, repository, &path)
+            .await
+            .forward::<MergeError>("resolving a link message path")?
+        {
+            link_messages.insert(path, message);
+        } else {
+            lore_info!("Leaving out the message for link {path}, which the merge removes");
+        }
+    }
+    Ok(())
 }
 
 async fn validate_link_messages(
@@ -3208,18 +3358,18 @@ pub async fn emit_conflict_events(
     }
 }
 
-/// The mount a link had before the merge, for an abort to return it to with its pin.
+/// The node a link mounted before the merge, for an abort to return it to with its pin.
 ///
 /// The merge may have remounted the link onto a subtree the pin it returns to does not hold.
 async fn pre_merge_mount(
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
     link_path: &str,
-) -> Result<link::LinkMountSource, MergeError> {
+) -> Result<NodeID, MergeError> {
     let pre_merge = link::resolve_link_at_path(state_current, repository.clone(), link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
-    Ok(link::LinkMountSource::Node(pre_merge.link_node.child))
+    Ok(pre_merge.link_node.child)
 }
 
 /// Per-entry view of a link merge ready to be rolled back or replayed.
@@ -3336,7 +3486,7 @@ pub async fn branch_merge_abort(
             .forward::<MergeError>("collecting the link's conflicted paths")?
             .files;
 
-            let mount_source = pre_merge_mount(&repository, &state_current, &r.link_path).await?;
+            let pre_merge_root = pre_merge_mount(&repository, &state_current, &r.link_path).await?;
 
             link::stage_link_pin(
                 repository.clone(),
@@ -3347,7 +3497,7 @@ pub async fn branch_merge_abort(
                 r.link_reference.signature,
                 entry.base.signature,
                 entry.base.branch,
-                mount_source,
+                link::LinkMountSource::Node(pre_merge_root),
                 link::LinkPinRealize::WorkingTree,
             )
             .await
@@ -3365,6 +3515,7 @@ pub async fn branch_merge_abort(
                     r.link_context.clone(),
                     r.link_path_rel.clone(),
                     base_link_state,
+                    pre_merge_root,
                     &conflict_paths,
                 )
                 .await
@@ -3450,7 +3601,9 @@ async fn merge_abort_link(
         .ok_or_else(|| MergeError::internal(format!("link not found: {link_path}")))?;
 
     // Restore on-disk content, stage restored node, and update link registry back to base
-    let mount_source = pre_merge_mount(&repository, &state_current, &link_path).await?;
+    let mount_source = link::LinkMountSource::Node(
+        pre_merge_mount(&repository, &state_current, &link_path).await?,
+    );
     link::stage_link_pin(
         repository.clone(),
         &state_staged,
@@ -4018,14 +4171,20 @@ pub async fn branch_merge_resolve(
     merge_resolve(repository, token, paths, MergeType::BranchMerge).await
 }
 
+/// Marks the conflict of the file at `relative_path`, which `node_link` finds in the State of
+/// `mapping`, resolved, where the working tree holds no conflict markers in it. A file staged for
+/// deletion, or one the working tree lacks, is staged from the working tree first
+/// ([`stage_resolved_from_working_tree`]); `side` is the current revision, the tree the merge was
+/// staged on, where the resolve reaches the parent's own tree.
 async fn resolve_single_file(
     operation: &Arc<InstanceOperationImpl>,
-    repository: &Arc<RepositoryContext>,
-    state_staged: &Arc<State>,
+    mapping: &NodeMapping,
+    side: Option<&State>,
     relative_path: RelativePath,
     node_link: NodeLink,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    let (repository, state_staged) = (&mapping.repository, &mapping.state);
     let block_index = NodeBlock::index(node_link.node);
     let node_index = Node::index(node_link.node);
     let block = state_staged
@@ -4048,18 +4207,29 @@ async fn resolve_single_file(
         return Ok(());
     }
 
-    if operation
+    let markers = operation
         .infer_is_conflicted(&relative_path)
         .await
         .forward_with::<MergeError, _>(|| {
             format!("checking {relative_path} for conflict markers")
-        })?
-    {
+        })?;
+    if markers == ConflictMarkers::Present {
         lore_warn!(
             "Cannot resolve path with conflict markers still present: {}",
             relative_path.as_str()
         );
         return Ok(());
+    }
+
+    let absent = markers == ConflictMarkers::NoFile;
+    if node.is_staged_delete() || absent {
+        Box::pin(stage_resolved_from_working_tree(
+            operation,
+            mapping,
+            side.filter(|_| absent),
+            &relative_path,
+        ))
+        .await?;
     }
 
     state_staged.node_change_in_place(
@@ -4102,89 +4272,246 @@ async fn resolve_single_file(
     Ok(())
 }
 
-/// The files at and below a single user path that a resolve marks resolved, with their nodes in
-/// `state`.
+/// Stages the file at `relative_path`, a conflict the State of `mapping` holds, from the working
+/// tree under the merge's flags: the commit takes what the working tree holds at a staged path, so
+/// a file there restores the add a deletion took back, and a missing one is a deletion. Where
+/// `side`, the current revision, is given for a file the working tree lacks, each directory above
+/// it that only the merge kept goes with it ([`stage::stage_emptied_ancestors`]).
 ///
-/// `node_link` is the entry-node lookup result for `user_relative` against the
-/// parent's staged state. For the parent branch `state` IS the parent staged
-/// state and `mount` is empty; for the link branch `state` is the link's own
-/// state and `mount` is the link's mount path. Directory expansion walks
-/// `state`, then strips `mount` to derive the state-relative path.
+/// Cold, as a resolve reaches it only for a conflict at a deleted or missing file, so its caller
+/// boxes it, and it boxes the stage.
+async fn stage_resolved_from_working_tree(
+    operation: &Arc<InstanceOperationImpl>,
+    mapping: &NodeMapping,
+    side: Option<&State>,
+    relative_path: &RelativePath,
+) -> Result<(), MergeError> {
+    let Some(below) = relative_path.below_ignore_case(&mapping.path) else {
+        return Err(MergeError::internal(
+            "A resolved path lies outside its tree",
+        ));
+    };
+    let Ok(below) = RelativePath::from_str(below);
+    let options = stage::StageOptions {
+        case_change: stage::StageCaseChange::Keep,
+        node_flags: NodeFlags::StagedMerge,
+        ..Default::default()
+    };
+    let stats = Arc::new(stage::StageStats::default());
+    Box::pin(stage::stage_filesystem_path(
+        operation.clone(),
+        mapping.clone(),
+        below,
+        stats.clone(),
+        options,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .await
+    .forward::<MergeError>("staging the resolved file from the working tree")?;
+    if let Some(side) = side {
+        stage::stage_emptied_ancestors(
+            operation,
+            &mapping.repository,
+            &mapping.state,
+            side,
+            relative_path,
+            &stats,
+            options,
+        )
+        .await
+        .forward::<MergeError>("staging the deletion of the directories a deletion empties")?;
+    }
+    Ok(())
+}
+
+/// The files at and below `user_relative`, which `node_link` finds in `state`, that a resolve marks
+/// resolved, with their nodes, and the mount and mounted node of each link the walk meets.
 async fn files_to_resolve(
     context: &Arc<RepositoryContext>,
     state: &Arc<State>,
-    mount: &str,
     user_relative: RelativePath,
-    node_link: node::NodeLink,
+    node_link: NodeLink,
     refusal: stage::ResolveRefusal,
-) -> Result<Vec<(RelativePath, NodeLink)>, MergeError> {
+) -> Result<FilesToResolve, MergeError> {
     let block = state
         .block(context.clone(), NodeBlock::index(node_link.node))
         .await
         .forward::<MergeError>("deserializing block")?;
-    let node = block.node(Node::index(node_link.node));
-
-    if node.is_file() {
-        return Ok(vec![(user_relative, node_link)]);
+    if block.node(Node::index(node_link.node)).is_file() {
+        return Ok(FilesToResolve {
+            files: vec![(user_relative, node_link)],
+            links: Vec::new(),
+        });
     }
-    // Expanded paths are user-side (rooted at `user_relative`); inside a
-    // link they need the mount prefix stripped before they can be resolved
-    // against `state` (which is link-relative).
     let expanded = stage::collect_merge_paths(
         context.clone(),
         state.clone(),
         node_link.node,
-        user_relative,
+        user_relative.clone(),
         UNRESOLVED_CONFLICTS,
         Some(refusal),
     )
     .await
-    .forward::<MergeError>("collecting the conflicted paths below a directory")?
-    .files;
-    let mut files = Vec::with_capacity(expanded.len());
-    for file_path in expanded {
-        let state_relative = if mount.is_empty() {
-            file_path.clone()
-        } else {
-            file_path
-                .as_str()
-                .strip_prefix(mount)
-                .and_then(|s| s.strip_prefix('/'))
-                .and_then(|s| RelativePath::from_str(s).ok())
-                .unwrap_or_else(|| file_path.clone())
+    .forward::<MergeError>("collecting the conflicted paths below a directory")?;
+    let mut files = Vec::with_capacity(expanded.files.len());
+    for file_path in expanded.files {
+        let Some(below) = file_path.below(&user_relative) else {
+            continue;
         };
         let file_node_link = state
-            .find_node_link(context.clone(), state_relative.as_str())
+            .find_relative_node_link(context.clone(), node_link.node, below)
             .await
             .unwrap_or_default();
         if file_node_link.is_valid() {
             files.push((file_path, file_node_link));
         }
     }
-    Ok(files)
+    Ok(FilesToResolve {
+        files,
+        links: expanded.links,
+    })
+}
+
+/// What [`files_to_resolve`] collected.
+struct FilesToResolve {
+    files: Vec<(RelativePath, NodeLink)>,
+    links: Vec<(RelativePath, NodeLink)>,
 }
 
 /// A link a resolve has reached, deserialized once however many of its paths are named.
 struct TouchedLink {
-    link_state: Arc<State>,
-    link_context: Arc<RepositoryContext>,
+    /// The link's own tree at its mount: the node of its State mounted there.
+    mounted: NodeMapping,
     link_branch: BranchId,
-    mount_path: String,
 }
 
-/// What resolving one path leaves for the next: each link's state deserialized once, and the
-/// parent's link list read once.
+/// A link of the parent's registry, where it is mounted and whether the merge merged it.
+struct LinkMount {
+    link: state::LinkReference,
+    mount: RelativePath,
+    merged: bool,
+}
+
+/// What resolving one path leaves for the next: each mount's link state deserialized once, and the
+/// parent's links read once.
 ///
-/// The pin update is deferred to the caller, so paths into one link share a single final write.
+/// The pin update is deferred to the caller, so paths into one mount share a single final write.
+/// Mounts of the same linked repository each pin their own state, so each is kept apart.
 #[derive(Default)]
 struct ResolveCache {
-    touched_links: std::collections::HashMap<RepositoryId, TouchedLink>,
-    link_list: Option<Vec<state::LinkReference>>,
+    /// Each mount reached, by its link node, or `None` for one the merge did not merge.
+    touched_links: std::collections::HashMap<NodeID, Option<TouchedLink>>,
+    links: Option<Vec<LinkMount>>,
 }
 
-/// The files a resolve marks resolved in one state: the linked repository's that the id names, or
-/// the parent's.
-type FilesToResolve = (Option<RepositoryId>, Vec<(RelativePath, NodeLink)>);
+/// The parent's links with their mounts, read once.
+async fn link_mounts<'a>(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    cache: &'a mut Option<Vec<LinkMount>>,
+) -> Result<&'a [LinkMount], MergeError> {
+    if let Some(links) = cache {
+        return Ok(links);
+    }
+    let links = link::links_and_merged(state_staged, repository.clone())
+        .await
+        .forward::<MergeError>("listing the links of the merge")?;
+    let mut mounts = Vec::with_capacity(links.len());
+    for (link, merged) in links {
+        let mount = state_staged
+            .node_path(repository.clone(), link.local_node)
+            .await
+            .forward::<MergeError>("resolving link mount path")?;
+        let Ok(mount) = RelativePath::from_str(&mount);
+        mounts.push(LinkMount {
+            link,
+            mount,
+            merged,
+        });
+    }
+    Ok(cache.insert(mounts))
+}
+
+/// The files at and below `relative_path`, which `node_link` finds inside a link, that a resolve
+/// marks resolved in the link's own state, with the node of the link mounted there. A link the
+/// merge did not merge holds none.
+async fn files_to_resolve_in_link(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    relative_path: RelativePath,
+    node_link: NodeLink,
+    refusal: &stage::ResolveRefusal,
+    cache: &mut ResolveCache,
+) -> Result<Vec<(Option<NodeID>, RelativePath, NodeLink)>, MergeError> {
+    let links = link_mounts(repository, state_staged, &mut cache.links).await?;
+    let Some(link_mount) = links
+        .iter()
+        .filter(|link_mount| {
+            link_mount.link.repository == node_link.repository
+                && relative_path.below(&link_mount.mount).is_some()
+        })
+        .max_by_key(|link_mount| link_mount.mount.as_str().len())
+    else {
+        lore_debug!("Ignoring {relative_path}, no link holds it");
+        return Ok(Vec::new());
+    };
+    let local_node = link_mount.link.local_node as NodeID;
+    let touched = match cache.touched_links.entry(local_node) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            if let Some(refused) = refusal
+                .entering_link(local_node, &link_mount.mount)
+                .await
+                .forward::<MergeError>("checking the link mount")?
+            {
+                return Err(refused.into());
+            }
+            let touched = if link_mount.merged {
+                let link_context = repository.to_link_context(node_link.repository).await;
+                let link_state =
+                    state::State::deserialize(link_context.clone(), link_mount.link.signature)
+                        .await
+                        .forward::<MergeError>("deserializing link state")?;
+                let node = state_staged
+                    .node(repository.clone(), local_node)
+                    .await
+                    .forward::<MergeError>("reading the link node")?
+                    .child;
+                Some(TouchedLink {
+                    mounted: NodeMapping {
+                        repository: link_context,
+                        state: link_state,
+                        path: link_mount.mount.clone(),
+                        node,
+                    },
+                    link_branch: link_mount.link.branch,
+                })
+            } else {
+                None
+            };
+            e.insert(touched)
+        }
+    };
+    let Some(touched) = touched else {
+        lore_debug!("Ignoring {relative_path}, the link holding it is not merged");
+        return Ok(Vec::new());
+    };
+    Ok(files_to_resolve(
+        &touched.mounted.repository,
+        &touched.mounted.state,
+        relative_path,
+        node_link,
+        refusal.inside_link(),
+    )
+    .await?
+    .files
+    .into_iter()
+    .map(|(path, node_link)| (Some(local_node), path, node_link))
+    .collect())
+}
 
 /// Resolves each of `paths` against the state that holds it, which for a path inside a link is
 /// the link's own rather than the parent's.
@@ -4192,13 +4519,14 @@ async fn resolve_paths(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_staged: &Arc<State>,
+    state_current: &State,
     paths: &LoreArray<LoreString>,
     merge_type: MergeType,
     cache: &mut ResolveCache,
 ) -> Result<(), MergeError> {
     let refusal = stage::ResolveRefusal::new(repository, state_staged);
     // Every path is checked before any is marked, so a refused resolve reports nothing resolved.
-    let mut to_resolve: Vec<FilesToResolve> = Vec::new();
+    let mut files = Vec::new();
     for path in paths.as_slice().iter() {
         let Ok(relative_path) =
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
@@ -4227,94 +4555,64 @@ async fn resolve_paths(
         }
 
         if node_link.repository != repository.id {
-            let link_list = if let Some(ref list) = cache.link_list {
-                list
-            } else {
-                let list = state_staged
-                    .link_list(repository.clone())
-                    .await
-                    .forward::<MergeError>("listing links")?;
-                cache.link_list = Some(list);
-                cache.link_list.as_ref().unwrap()
-            };
-
-            let touched = match cache.touched_links.entry(node_link.repository) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let link_context = repository.to_link_context(node_link.repository).await;
-                    let link_state =
-                        state::State::deserialize(link_context.clone(), node_link.revision)
-                            .await
-                            .forward::<MergeError>("deserializing link state")?;
-                    let link_ref = link_list
-                        .iter()
-                        .find(|l| l.repository == node_link.repository)
-                        .copied();
-                    let (mount_path, link_branch) = if let Some(link_ref) = link_ref {
-                        let mount = state_staged
-                            .node_path(repository.clone(), link_ref.local_node)
-                            .await
-                            .forward::<MergeError>("resolving link mount path")?;
-                        let Ok(mount_rel) = RelativePath::from_str(&mount);
-                        if let Some(refused) = refusal
-                            .entering_link(link_ref.local_node as NodeID, &mount_rel)
-                            .await
-                            .forward::<MergeError>("checking the link mount")?
-                        {
-                            return Err(refused.into());
-                        }
-                        (mount, link_ref.branch)
-                    } else {
-                        (String::new(), BranchId::default())
-                    };
-                    e.insert(TouchedLink {
-                        link_state,
-                        link_context,
-                        link_branch,
-                        mount_path,
-                    })
-                }
-            };
-
-            let files = files_to_resolve(
-                &touched.link_context,
-                &touched.link_state,
-                &touched.mount_path,
-                relative_path,
-                node_link,
-                refusal.inside_link(),
-            )
-            .await?;
-            to_resolve.push((Some(node_link.repository), files));
+            files.append(
+                &mut files_to_resolve_in_link(
+                    repository,
+                    state_staged,
+                    relative_path,
+                    node_link,
+                    &refusal,
+                    cache,
+                )
+                .await?,
+            );
             continue;
         }
 
-        let files = files_to_resolve(
+        let collected = files_to_resolve(
             repository,
             state_staged,
-            "",
             relative_path,
             node_link,
             refusal.clone(),
         )
         .await?;
-        to_resolve.push((None, files));
+        files.extend(
+            collected
+                .files
+                .into_iter()
+                .map(|(path, node_link)| (None, path, node_link)),
+        );
+        for (mount, mounted) in collected.links {
+            files.append(
+                &mut files_to_resolve_in_link(
+                    repository,
+                    state_staged,
+                    mount,
+                    mounted,
+                    &refusal,
+                    cache,
+                )
+                .await?,
+            );
+        }
     }
 
-    for (link, files) in to_resolve {
-        let (context, state) = match link {
-            Some(link) => {
-                let touched = cache
+    let root = NodeMapping::root(repository.clone(), state_staged.clone());
+    for (local_node, file_path, node_link) in files {
+        let (mapping, side) = match local_node {
+            None => (&root, Some(state_current)),
+            Some(local_node) => (
+                &cache
                     .touched_links
-                    .get(&link)
-                    .ok_or_else(|| MergeError::internal("A resolved link was not read"))?;
-                (&touched.link_context, &touched.link_state)
-            }
-            None => (repository, state_staged),
+                    .get(&local_node)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| MergeError::internal("A resolved link was not read"))?
+                    .mounted,
+                None,
+            ),
         };
-        for (path, node_link) in files {
-            resolve_single_file(operation, context, state, path, node_link, merge_type).await?;
-        }
+        resolve_single_file(operation, mapping, side, file_path, node_link, merge_type).await?;
     }
     Ok(())
 }
@@ -4325,11 +4623,11 @@ pub async fn merge_resolve(
     paths: LoreArray<LoreString>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
-    let (_state_current, state_staged, _branch) =
+    let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
-    let state_staged = state_staged.unwrap_or_else(|| _state_current.clone());
+    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     validate_merge_type(repository.clone(), state_staged.clone(), merge_type).await?;
 
@@ -4345,14 +4643,15 @@ pub async fn merge_resolve(
 
     let mut cache = ResolveCache::default();
 
-    // One operation covers every path: resolving reads the working copy to tell a conflict
-    // still marked up from one settled. Nothing is written: the resolution is recorded in the
-    // staged state.
+    // One operation covers every path: resolving reads the working tree to tell a conflict still
+    // marked up from one settled, and stages a deleted or missing file from it, removing a
+    // directory only the merge's change of the file kept.
     with_operation(repository.file_system(), async |operation| {
         resolve_paths(
             &operation,
             &repository,
             &state_staged,
+            &state_current,
             &paths,
             merge_type,
             &mut cache,
@@ -4363,19 +4662,17 @@ pub async fn merge_resolve(
 
     // Re-serialize each touched link once and update the parent's pin; the
     // parent serialize+anchor below picks up all of these in a single write.
-    for (_repo_id, touched) in cache.touched_links {
-        if touched.mount_path.is_empty() {
-            continue;
-        }
+    for touched in cache.touched_links.into_values().flatten() {
         let new_link_sig = touched
-            .link_state
-            .serialize(touched.link_context.clone(), token)
+            .mounted
+            .state
+            .serialize(touched.mounted.repository.clone(), token)
             .await
             .forward::<MergeError>("serializing link state")?;
         link::update_link_pin_by_path(
             &state_staged,
             repository.clone(),
-            &touched.mount_path,
+            touched.mounted.path.as_str(),
             touched.link_branch,
             new_link_sig,
         )

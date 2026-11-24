@@ -8,10 +8,11 @@ Lore has two filters with one syntax. A [view filter](../glossary.md#view-filter
 | --- | --- | --- |
 | **Lives in** | `.lore/view` in the [instance](../glossary.md#repository-instance) | `.loreignore` at the repository root, and `.lore/ignore` in the instance |
 | **Set with** | `lore clone --view <file>`, then only `lore sync --view <file>`. Never edit `.lore/view`. | Editing the files. Commit `.loreignore` to share it. |
-| **Applies to** | Clone, sync, branch switch, and reset. Status and stage see only what it keeps. | Status, stage, dirty marking, locks, and the sizes `lore file info` reports, for paths neither committed nor staged (with `--revision`, paths that revision doesn't hold), and the destination of `lore stage move`. Not clone, sync, branch switch, or reset. |
+| **Applies to** | Clone, sync, branch switch, and reset. Stage, and unstage outside a layer mount, see only what it keeps unless forced. Status lists what it keeps and what is staged past it. | Status, stage, dirty marking, locks, and the sizes `lore file info` reports, for paths neither committed nor staged (with `--revision`, paths that revision doesn't hold), and the destination of `lore stage move`. Not clone, sync, branch switch, or reset. |
 
 - `.lore/ignore` holds exclusions for your instance alone, and is never committed. Its rules win over re-inclusions in `.loreignore`. Lore skips a `!` re-inclusion in it with a warning.
 - As in Git, ignore rules apply only to untracked paths: status still reports a committed or staged file's edits and deletion, stage takes them, and lock commands and the sizes `lore file info` reports include the file. The exception is `lore stage move`, which refuses a destination a rule matches, even for a tracked file, unless you give `--force`. Add an ignored file with `lore --force stage <path>`. On a directory, `--force` stages everything the directory holds but Lore's own entries, unchanged files included. Remove a tracked one by deleting it and running `lore stage <path>`.
+- `lore --force stage` reaches past the view as well, and the commit takes such a file from your working tree. A merge stages its changes at paths the view excludes too, and the commit takes those as the merge staged them, unless you force-stage the file: that resolves the merge with your file, as editing a merged file in view does. Status lists both as staged. `lore unstage` follows the view and leaves them staged; `lore --force unstage` takes back what you force-staged outside a merge. Below a layer mount, `lore unstage` doesn't follow the view yet.
 - Lore also ignores, as built-in rules, anything named `.lore` or `.urc` at any depth, and names ending in `~mine`, `~theirs`, or `~base` (merge copies), or `.~loretemp`. A forced stage takes only the `~mine` ones.
 
 ## Rule syntax
@@ -64,7 +65,7 @@ Write `/a/` and `!/a/` for a directory.
 
 - **Only the root `.loreignore` counts.** One in a subdirectory has no effect.
 - **Matching ignores case**, and Lore trims spaces at both ends of a line. Git matches case on a case-sensitive file system, and keeps leading spaces.
-- **Re-inclusion works below an excluded directory**, as [Re-include one file deep inside an excluded tree](#re-include-one-file-deep-inside-an-excluded-tree) shows.
+- **Re-inclusion works below an excluded directory**, as [Re-include one file deep inside an excluded tree](#re-include-one-file-deep-inside-an-excluded-tree) shows, unless a later rule excludes a directory on the way: adding `/Engine/*/` to the end of that example leaves `impl.cpp` out, so put the re-inclusion after `/Engine/*/` to keep it.
 - **A path re-inclusion covers its subtree.** After `**`, `!/Engine/Config/` brings back `base.ini` too. One ending in `*`, such as `!/*`, re-includes only what it matches, so after `**` what lies below it stays excluded.
 - **A path re-inclusion that starts with `**`, such as `!**/Saved/Config/`, is refused.** `lore clone --view` and `lore sync --view` refuse a view holding one. Under a `.loreignore` holding one, every command in the instance fails until you remove the line:
 

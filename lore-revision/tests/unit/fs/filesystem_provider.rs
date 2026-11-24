@@ -29,6 +29,7 @@ use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
@@ -47,6 +48,7 @@ pub struct TestFilesystemProvider {
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
     pub hold_calls: HoldCalls,
+    pub warm_count: Arc<AtomicUsize>,
     pub stored_calls: StoredCalls,
     pub committed_calls: CommittedCalls,
     /// The directory file information and content are read from, where given.
@@ -236,10 +238,12 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
                 file_info_fails: self.file_info_fails,
+                failing_file_infos: Arc::default(),
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
+                warm_count: self.warm_count.clone(),
                 stored_calls: self.stored_calls.clone(),
                 committed_calls: self.committed_calls.clone(),
                 committed_fails: self.committed_fails,
@@ -826,11 +830,12 @@ async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
                     .await
                     .expect("a path holding no file is an answer")
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&path)
                     .await
-                    .expect("a path holding no file is an answer")
+                    .expect("a path holding no file is an answer"),
+                ConflictMarkers::NoFile
             );
         })
         .await;

@@ -18,10 +18,18 @@ use crate::repository::RepositoryContext;
 /// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
 /// the remote is valid.
 pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+    context_built(state, |context| context).await
+}
+
+/// [`context_with_state`] with `build` applied, for a context set up through its builders.
+pub async fn context_built(
+    state: RemoteState,
+    build: impl FnOnce(RepositoryContext) -> RepositoryContext,
+) -> Arc<RepositoryContext> {
     let (immutable, mutable) = crate::repository::create_client_memory_stores()
         .await
         .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
+    Arc::new(build(RepositoryContext::new_with_state(
         None,
         immutable,
         mutable,
@@ -30,7 +38,7 @@ pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
         state,
         Arc::default(),
         None,
-    ))
+    )))
 }
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one
@@ -228,5 +236,40 @@ pub(crate) async fn branch_step(step: BranchStep) {
     };
     if stepped.reached.send(step).is_ok() {
         stepped.resume.notified().await;
+    }
+}
+
+/// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
+/// inode table counting no lookups, and what it waits for to go on.
+#[derive(Clone)]
+struct DrainHold {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+}
+
+tokio::task_local! {
+    static DRAIN_HOLD: DrainHold;
+}
+
+/// Runs `future`, stopping each FUSE unmount's drain it runs wherever the drain finds the inode
+/// table counting no lookups, before it waits for the count to settle: a `()` is sent on
+/// `reached`, and the drain waits for a notification of `resume` before it goes on. Tasks
+/// `future` spawns don't stop.
+pub fn hold_unmount_drains<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    DRAIN_HOLD.scope(DrainHold { reached, resume }, future)
+}
+
+/// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
+/// where it runs under [`hold_unmount_drains`].
+pub(crate) async fn unmount_drain_emptied() {
+    let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
+        return;
+    };
+    if hold.reached.send(()).is_ok() {
+        hold.resume.notified().await;
     }
 }

@@ -41,6 +41,7 @@ use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
+use crate::infer::ConflictMarkers;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore_debug;
@@ -48,6 +49,7 @@ use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
@@ -270,6 +272,15 @@ impl FilesystemDiffIntent {
         )
     }
 
+    /// The intent a walk takes below a directory that replaced a file, all of whose content is
+    /// new, so that a walk reporting tracked content alone reports it.
+    pub fn below_replacement(self) -> Self {
+        match self {
+            FilesystemDiffIntent::ReportTracked => FilesystemDiffIntent::Report,
+            intent => intent,
+        }
+    }
+
     /// What the walk stages beyond marking, where it stages at all.
     pub fn stage(self) -> Option<StageIntent> {
         match self {
@@ -277,6 +288,23 @@ impl FilesystemDiffIntent {
             _ => None,
         }
     }
+}
+
+/// Where a marking walk adds the directories leading to a path a caller names that the `from`
+/// tree lacks: below `node` of the `from` tree, which the leading `skip` bytes of the path name,
+/// with their separator. Past a link, `node` is in the tree the walk reached.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainRoot {
+    pub node: NodeID,
+    pub skip: u32,
+}
+
+impl ChainRoot {
+    /// The root, standing for none of the path.
+    pub const ROOT: ChainRoot = ChainRoot {
+        node: crate::node::ROOT_NODE,
+        skip: 0,
+    };
 }
 
 /// What to diff against the filesystem: `from` is the tree it is compared against and
@@ -291,17 +319,17 @@ pub struct FilesystemDiffContext {
     /// The path as the file system spells it, which parts from the mappings' own spelling only
     /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
-    /// The filter's verdict at `filesystem_path`, or at its parent where `asks_path` is set,
+    /// The filter's verdict at `filesystem_path`, or at its parent where `named_path` is set,
     /// which each child steps from rather than refolding the ancestors it already accounts for.
     pub states: FilterStates,
     /// The same verdict on the `from` side, which diverges from `states` once a move
     /// puts the two sides at different paths.
     pub from_states: FilterStates,
-    /// Whether the walk asks the filter about `filesystem_path` itself once it reads what the
-    /// working tree holds there, `states` and `from_states` then being the verdict at its parent.
-    /// A walk over a path a caller names does; below it, each listing asks about the entries it
-    /// lists.
-    pub asks_path: bool,
+    /// Set for a walk over a path a caller names, to where a marking walk starts the directories
+    /// leading to it. The walk asks the filter about `filesystem_path` itself once it reads what
+    /// the working tree holds there, `states` and `from_states` then being the verdict at its
+    /// parent; below it, each listing asks about the entries it lists.
+    pub named_path: Option<ChainRoot>,
     pub filter_mode: FilterMode,
     pub intent: FilesystemDiffIntent,
     pub layer_mounts: Arc<Vec<LayerMountInfo>>,
@@ -919,10 +947,10 @@ pub trait InstanceOperation: Send + Sync {
         }
     }
 
-    /// Whether the content at `path` holds conflict markers.
+    /// Whether the content at `path` holds conflict markers, or the path holds no file.
     ///
-    /// Content that cannot be opened or read holds none, a failed read logged at debug, and neither
-    /// does a path holding no file. A provider that cannot name the content of a file reports why
+    /// Content that cannot be opened or read holds none, a failed read logged at debug. A provider
+    /// that cannot name the content of a file reports why
     /// ([`content_source`](Self::content_source)).
     ///
     /// Derived from [`content_source`](Self::content_source). A provider that answers without
@@ -930,18 +958,18 @@ pub trait InstanceOperation: Send + Sync {
     fn infer_is_conflicted(
         &self,
         path: &RelativePath,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+    ) -> impl Future<Output = Result<ConflictMarkers, FsError>> + Send {
         async move {
             let source = match self.content_source(path).await {
                 Ok(source) => source,
-                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(FsError::FileNotFound(_)) => return Ok(ConflictMarkers::NoFile),
                 Err(err) => return Err(err),
             };
             Ok(crate::infer::infer_is_conflicted(&source)
                 .await
                 .unwrap_or_else(|err| {
                     lore_debug!("Conflict check cannot read {path}: {err}");
-                    false
+                    ConflictMarkers::Absent
                 }))
         }
     }
@@ -1295,6 +1323,31 @@ impl InstanceOperationImpl {
             "Unable to hold a revision through an operation that holds no State",
         ))
     }
+
+    /// Reads the ignore file at the root of the revision the provider serves into the local store,
+    /// where the provider holds its state in a `State` ([`FilesystemProvider::holds_state`]), so a
+    /// command run offline finds it. A failure is left for the next command to report. Other
+    /// providers read the ignore file from the working tree, and nothing is read here, nor in a dry
+    /// run.
+    #[lore_macro::test_pub]
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub(crate) async fn warm_held_ignore_file(&self) {
+        if self.dry_run {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.filesystem().warm_ignore_file().await;
+        }
+        #[cfg(feature = "test-util")]
+        if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.warm_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl InstanceOperation for InstanceOperationImpl {
@@ -1637,7 +1690,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
+    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<ConflictMarkers, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
@@ -1735,8 +1788,9 @@ pub mod test_util {
     pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
 
     /// Answers the reads and the directory create these tests make, refuses each rename, and
-    /// records each finalize, `stored` and `committed` call, hold and recursive removal. Every
-    /// other member panics.
+    /// records each finalize, `stored` and `committed` call, hold, warm-up of the held ignore file
+    /// and recursive removal. Every other member panics.
+    #[derive(Default)]
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1747,12 +1801,17 @@ pub mod test_util {
         /// Whether the provider cannot describe any path, as one that cannot stat the working
         /// tree.
         pub file_info_fails: bool,
+        /// Paths the provider cannot describe.
+        pub failing_file_infos: Arc<Mutex<Vec<String>>>,
         pub holds_paths: bool,
         /// Whether the provider cannot name the content at any path.
         pub content_source_fails: bool,
         /// Whether the provider holds no file at any path.
         pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
+        /// How many times the held ignore file was read into the store
+        /// ([`InstanceOperationImpl::warm_held_ignore_file`]).
+        pub warm_count: Arc<AtomicUsize>,
         pub stored_calls: StoredCalls,
         pub committed_calls: CommittedCalls,
         /// Whether each `committed` call fails.
@@ -1858,10 +1917,17 @@ pub mod test_util {
         }
 
         /// Counts the lookup, and reports what the directory it reads from holds where given and
-        /// otherwise what the provider was told to hold.
+        /// otherwise what the provider was told to hold, except where it was told it cannot
+        /// describe the path.
         async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            if self.file_info_fails {
+            if self.file_info_fails
+                || self
+                    .failing_file_infos
+                    .lock()
+                    .iter()
+                    .any(|failing| failing == path.as_str())
+            {
                 return Err(FsError::internal("File information failed"));
             }
             match &self.reads {

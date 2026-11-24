@@ -711,9 +711,9 @@ pub struct LoreGlobalArgs {
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
-    /// Cache fragment payloads fetched from remote in the local store. Without
-    /// this only state fragments and fragments flagged for local cache priority
-    /// are retained
+    /// Cache fragment payloads fetched from remote, and those written, in the local store, as
+    /// a repository's `[store] cache_payloads` does for every command. Without either only state
+    /// fragments and fragments flagged for local cache priority are retained
     pub cache: u8,
     /// Authentication token to use instead of the one held in the secure token
     /// store. Authorization tokens are exchanged from it as they are needed.
@@ -1050,11 +1050,10 @@ pub struct ExecutionContext {
     /// no counters, and only a push reads them whatever the level.
     fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
     /// What this call's push registered with the peer, accumulated across every
-    /// revision, link and layer it covers.
-    ///
-    /// Kept whatever the statistics level: the per-revision progress event reads
-    /// its share out of these, so they are load-bearing rather than diagnostic.
+    /// revision, link and layer it covers, for the statistics event.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
+    /// The query and upload slots every push this call makes shares.
+    push_budget: OnceLock<crate::branch::push::PushBudget>,
     /// The environment of the process that relayed this call, read in place of this process's
     /// through [`lore_base::env::var`]. `None` for a call made in this process.
     environment: Option<CallEnvironment>,
@@ -1185,6 +1184,12 @@ impl ExecutionContext {
         self.push_stats
             .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
     }
+
+    /// The slots this call's pushes share. See the field.
+    pub(crate) fn push_budget(&self) -> &crate::branch::push::PushBudget {
+        self.push_budget
+            .get_or_init(crate::branch::push::PushBudget::default)
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1200,6 +1205,7 @@ impl Default for ExecutionContext {
             caller_state: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
+            push_budget: OnceLock::new(),
             environment: None,
         }
     }

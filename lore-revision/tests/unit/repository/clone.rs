@@ -39,6 +39,7 @@ use zerocopy::FromZeros;
 use crate::branch::null_repository;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::hooked_store::StoreCall;
+use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
@@ -312,11 +313,6 @@ async fn state_of_unwritable_files(
     state
 }
 
-/// Whether `error`, or an error among its sources, is a `T`.
-fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
-}
-
 /// A clone with unavailable content reports the missing address even when discovery spans
 /// many blocks and more files than the work channel can hold.
 #[tokio::test]
@@ -347,6 +343,38 @@ async fn a_clone_reports_missing_content_across_many_blocks() {
                 caused_by::<AddressNotFound>(&error),
                 "the clone reported {error:?} rather than the content it could not fetch"
             );
+        })
+        .await;
+}
+
+/// A clone whose root file the revision does not hold reports the file as not found.
+#[tokio::test]
+async fn a_clone_reports_a_missing_root_file_as_not_found() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-missing-root-file-");
+            let repository = working_tree_repository(temp.path()).await;
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state: State::new(),
+                options: Arc::new(CloneOptions {
+                    root_files: vec!["missing.txt".to_string()],
+                    ..Default::default()
+                }),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            let error = clone_in_path(ctx)
+                .await
+                .expect_err("the root file is missing");
+
+            assert!(error.is_file_not_found(), "{error:?}");
         })
         .await;
 }

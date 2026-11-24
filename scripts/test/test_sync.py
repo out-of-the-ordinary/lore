@@ -16,21 +16,17 @@ from error_types import (
     ProtectedError,
     UnknownLoreError,
 )
-from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
+from lore_parsers import (
+    find_status_entry,
+    parse_jsonl,
+    parse_status_json,
+    parse_status_summary_json,
+)
 from test_utils import to_posix
 
 from lore import Lore
 
 logger = logging.getLogger(__name__)
-
-
-def find_status_entry(entries: list[dict], path: str) -> dict | None:
-    """Find a status entry by path (posix-normalized)."""
-    target = to_posix(path)
-    for entry in entries:
-        if to_posix(entry.get("path", "")) == target:
-            return entry
-    return None
 
 
 @pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
@@ -685,6 +681,66 @@ def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
 def _read_bytes(repo: Lore, name: str) -> bytes:
     with repo.open_file(name, "rb") as f:
         return f.read()
+
+
+def _commit_move(repo: Lore, modified: bool):
+    """Commits and pushes a move of `moved/from.txt` to `moved/to.txt`, with other content where
+    `modified`."""
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    if modified:
+        repo.write_files({"moved/to.txt": "incoming\n"})
+        repo.stage("moved/to.txt")
+    repo.commit("Move")
+    repo.push()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("modified", [False, True], ids=["move", "move and modify"])
+def test_sync_refuses_a_move_of_a_locally_edited_file(new_lore_repo, modified):
+    """An edit at the path an incoming move carries a file from is local work, refused as an
+    edit at the path it moves to is, whether or not the move changes the content."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    clone: Lore = repo.clone()
+    _commit_move(repo, modified)
+    clone.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        clone.sync()
+
+    with clone.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused sync should keep the edit"
+    assert not clone.file_exists("moved/to.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Requires case-sensitive filesystem"
+)
+def test_sync_refuses_a_directory_rename_in_case_onto_a_locally_edited_file(
+    new_lore_repo,
+):
+    """An edit to a file in a directory an incoming move renames in case, which changes the file
+    too, is local work the sync refuses, and keeps. The file's change is no move of its own, so
+    the sync finds the edit at the path the file stood at below the renamed directory."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"dir/a.txt": "base\n", "dir/b.txt": "b\n"})
+    clone: Lore = repo.clone()
+    repo.move("dir", "Dir")
+    repo.stage_move("dir", "Dir")
+    repo.write_files({"Dir/a.txt": "incoming\n"})
+    repo.stage("Dir/a.txt")
+    repo.commit("Rename the directory in case")
+    repo.push()
+    clone.write_files({"dir/a.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        clone.sync()
+
+    with clone.open_file("dir/a.txt") as f:
+        assert f.read() == "locally edited\n", "the refused sync should keep the edit"
+    assert not clone.path_exists("Dir")
 
 
 @pytest.mark.smoke
@@ -1662,3 +1718,29 @@ def test_sync_merge_of_divergent_history_keeps_the_remote_change_before_its_late
         remote_change,
         base,
     ]
+
+
+@pytest.mark.smoke
+def test_sync_of_diverged_history_records_no_deletion_the_remote_made(new_lore_repo):
+    """A sync merging the remote latest into diverged local history records no deletion the
+    remote made, though the remote's tree reuses the deleted file's slot for a file it adds:
+    the merge revision holds that file."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"gone.txt": "gone\n", "kept.txt": "kept\n"})
+    clone = repo.clone()
+
+    repo.remove_file("gone.txt")
+    repo.stage(["gone.txt"])
+    repo.commit("Delete a file")
+    repo.write_commit_push("Add a file", {"added.txt": "added\n"})
+
+    clone.write_files({"local.txt": "local\n"})
+    clone.stage(scan=True)
+    clone.commit("Add a local file")
+    clone.sync()
+
+    deltas = parse_jsonl(
+        clone.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [delta for delta in deltas if delta["action"] == "delete"] == [], deltas
+    assert clone.file_exists("added.txt") and not clone.file_exists("gone.txt")

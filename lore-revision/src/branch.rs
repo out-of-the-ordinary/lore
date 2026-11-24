@@ -24,6 +24,7 @@ use lore_base::text::fold_eq;
 use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
+use lore_transport::BranchRecord;
 use lore_transport::Connection;
 use lore_transport::MatchedProtocolError;
 use lore_transport::ProtocolError;
@@ -839,6 +840,9 @@ pub fn load_name_to_id(
 /// claimed only after the remote's metadata of its branch is cached ([`cache_remote_metadata`]). A
 /// failed write is ignored.
 ///
+/// Of the remote's record it keeps only the id and metadata across its awaits, and of the
+/// fallback's answer only the id.
+///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn load_name_to_id_unmapped(
@@ -852,13 +856,15 @@ fn load_name_to_id_unmapped(
         )? && let Some(revision_service) = absent_unless_refused::<_, _, BranchError>(
             remote.revision(repository.id).await,
             "connecting to the remote revision service",
-        )? && let Some(response) = absent_unless_refused::<_, _, BranchError>(
-            revision_service.branch_query(None, Some(name)).await,
+        )? && let Some((branch, metadata)) = absent_unless_refused::<_, _, BranchError>(
+            revision_service
+                .branch_query(None, Some(name))
+                .await
+                .map(|record| (record.id, record.metadata)),
             "querying the remote for the branch name",
-        )? && !response.id.is_zero()
+        )? && !branch.is_zero()
         {
-            let branch = response.id;
-            if cache_remote_metadata(repository.clone(), branch, response.metadata)
+            if cache_remote_metadata(repository.clone(), branch, metadata)
                 .await
                 .is_ok()
             {
@@ -867,7 +873,6 @@ fn load_name_to_id_unmapped(
             return Ok(branch);
         }
 
-        // An `Ok(Some(id))` pattern would hold the whole result across the claim.
         if let Some(id) = live_fallback_id(repository.clone(), name)
             .await
             .ok()
@@ -1081,7 +1086,7 @@ pub async fn load_last_sync(
 
     if let Ok(metadata) = metadata_local(repository.clone(), branch).await
         && let Ok(branch_metadata) = branch_metadata(repository.clone(), branch, &metadata).await
-        && let Some(parent) = branch_metadata.stack.first()
+        && let Some(parent) = branch_metadata.branch_point()
     {
         Ok(parent.revision)
     } else {
@@ -1167,6 +1172,32 @@ pub async fn store_latest(
 
 pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchId, revision: Hash) {
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
+}
+
+/// Stores `latest`, a revision on the history the remote holds for `branch`, as the branch's local
+/// latest in place of `previous`, convergent, and as its last synchronized revision: what a sync, a
+/// clone and a push record once the remote answers for a revision.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn store_synced_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    previous: Hash,
+    latest: Hash,
+) -> impl Future<Output = Result<(), BranchError>> + '_ {
+    async move {
+        store_latest(
+            repository.clone(),
+            branch,
+            previous,
+            latest,
+            BranchLatestStatus::Convergent,
+        )
+        .await?;
+        store_last_sync(repository.clone(), branch, latest).await;
+        Ok(())
+    }
 }
 
 pub async fn load_latest_history(
@@ -1303,6 +1334,7 @@ async fn load_local_or_remote(
 /// Stores `hash` as the metadata hash of `branch` in the local mutable store, over whatever the key
 /// holds. Tests only: every other metadata write is a compare-and-swap.
 #[lore_macro::test_pub]
+#[allow(dead_code)]
 async fn mutable_store_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -1881,9 +1913,9 @@ pub struct CreatedBranch {
 /// 3. Check the parent and, outside a dry run, create the linked branches and write the record
 ///    (`create_record`), claiming the name from that value.
 ///
-/// A name that isn't valid fails with [`InvalidArguments`] before step 1, and so does, in step 3, a
-/// parent that is zero, the branch itself, or a personal branch, or a zero parent revision on a
-/// branch other than the default branch.
+/// A name that isn't valid, or a zero `branch`, fails with [`InvalidArguments`] before anything is
+/// written. In step 3, a parent that is zero, the branch itself, or a personal branch, or a zero
+/// parent revision on a branch other than the default branch, fails with [`InvalidArguments`] too.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_at(
     repository: Arc<RepositoryContext>,
@@ -1903,6 +1935,7 @@ pub async fn create_at(
             reason: format!("the branch name {name:?} is not valid"),
         }));
     }
+    check_new_branch_id(branch, name)?;
 
     if restore_existing_branch(
         repository.clone(),
@@ -2088,6 +2121,16 @@ pub async fn create_at(
         head,
         staged,
     })
+}
+
+/// Fails with [`InvalidArguments`] where `branch`, the id of the new branch `name`, is zero.
+fn check_new_branch_id(branch: BranchId, name: &str) -> Result<(), BranchError> {
+    if branch.is_zero() {
+        return Err(BranchError::from(InvalidArguments {
+            reason: format!("the id of the new branch {name} is zero"),
+        }));
+    }
+    Ok(())
 }
 
 /// The value a create claims `name` from: the value of the name's mapping in the local store, zero
@@ -2844,11 +2887,7 @@ pub fn create_record(
     name_expected: Context,
 ) -> impl Future<Output = Result<(), BranchError>> {
     async move {
-        if branch.is_zero() {
-            return Err(BranchError::from(InvalidArguments {
-                reason: format!("the id of the new branch {name} is zero"),
-            }));
-        }
+        check_new_branch_id(branch, name)?;
         let metadata_hash = {
             let mut metadata = Metadata::new();
             metadata_populate(
@@ -3559,17 +3598,18 @@ pub async fn purge_mapped_branches(repository: Arc<RepositoryContext>) {
     }
 }
 
+/// The records of the live branches of `repository` at the remote.
 pub async fn list_remote(
     remote: Arc<Connection>,
     repository: RepositoryId,
-) -> Result<Vec<BranchMetadata>, BranchError> {
+) -> Result<Vec<BranchRecord>, BranchError> {
     let remote = remote
         .revision(repository)
         .await
         .forward::<BranchError>("Failed to connect to remote revision service")?;
 
     let response = remote
-        .branch_list()
+        .branch_list(None, false)
         .await
         .forward::<BranchError>("Failed to list branches on remote")?;
 
@@ -3581,7 +3621,7 @@ pub(crate) async fn list_remote_bounded(
     remote: Arc<Connection>,
     repository: RepositoryId,
     limit: usize,
-) -> Result<Option<Vec<BranchMetadata>>, BranchError> {
+) -> Result<Option<Vec<BranchRecord>>, BranchError> {
     let remote = remote
         .revision(repository)
         .await
@@ -4222,7 +4262,9 @@ fn emit_diff_item_with_auto_resolve(
 /// Realises the three sides of one conflict into temp files and runs
 /// `merge3_text_by_pathbuf`. Returns `Some(resolved_change)` only when
 /// the merge produces no conflict markers — any merge failure or any
-/// markers in the output preserve the conflict (returns `None`).
+/// markers in the output preserve the conflict (returns `None`). The
+/// resolved change carries the executable bit [`change::merged_mode`] gives
+/// the file.
 #[lore_macro::test_pub]
 async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
@@ -4406,11 +4448,15 @@ async fn try_auto_resolve_conflict(
     let _ = util::fs::unlink(mine_path).await;
 
     if resolved {
+        let mut to = change_to.to.clone();
+        if let Some(mode) = change::merged_mode(change_from, change_to) {
+            to.mode = mode;
+        }
         Ok(Some(NodeChange {
             action: change_to.action,
             flags: change_to.flags | change::Flags::ConflictAutomerged,
             from: change_to.from.clone(),
-            to: change_to.to.clone(),
+            to,
         }))
     } else {
         Ok(None)
@@ -4988,10 +5034,11 @@ async fn find_common_revision_in_history_lines(
     }
 }
 
-/// Load a line of revisions from `revision` backwards through self parents, each
-/// with its revision number. Falls back to a local walk when the batch load comes
-/// back empty, so a repository with no reachable remote still contributes the line
-/// it has cached. Fails where the batch load does, as [`find::batch_load_history`]
+/// Load a line of revisions from `revision` backward through self parents, each
+/// with its revision number. Falls back to a walk that reads each state as
+/// `repository` reads it, from the remote where it has one, when the batch load
+/// comes back empty, as where the store lacks `revision` and the remote cannot
+/// list its line. Fails where the batch load does, as [`find::batch_load_history`]
 /// describes.
 #[lore_macro::test_pub]
 async fn load_history_line(
@@ -5008,7 +5055,9 @@ async fn load_history_line(
         return Ok(history);
     }
 
-    lore_debug!("Found no revision from {revision}, walking locally");
+    lore_debug!(
+        "Found no revision from {revision} in a batch, reading the line's states one at a time"
+    );
 
     let mut history = Vec::new();
     let Ok(mut state_iter) = state::State::deserialize(repository.clone(), revision).await else {
@@ -5053,16 +5102,7 @@ async fn load_additional_history(
     let additional = find::batch_load_history(repository.clone(), last)
         .await
         .forward::<BranchError>("loading the next batch of a history line")?;
-
-    // `batch_load_history` yields its start revision first, and that revision is
-    // already the tail of `history`. Appending it again both duplicates work for
-    // the caller's comparison and, once the line is exhausted, keeps reporting
-    // progress that does not exist.
-    let fresh = match additional.split_first() {
-        Some((first, rest)) if first.1 == last => rest,
-        _ => additional.as_slice(),
-    };
-
+    let fresh = find::below(&additional, last);
     if fresh.is_empty() {
         return Ok(true);
     }

@@ -11,7 +11,6 @@
 #[cfg(all(test, feature = "integration_tests", target_os = "linux"))]
 mod fuse_remote_tests {
     use std::collections::HashMap;
-    use std::net::SocketAddr;
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
     use std::path::PathBuf;
@@ -401,14 +400,15 @@ mod fuse_remote_tests {
     /// A `lore://` server over `store`: storage on QUIC, everything else on gRPC, one port.
     struct Server {
         url: String,
-        addr: SocketAddr,
         quic: Option<QuinnServer>,
         grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<String>>,
+        grpc_stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     }
 
     impl Server {
-        /// Stops serving and waits until the port no longer accepts.
+        /// Stops serving: closes the QUIC endpoints and waits until they are idle, then stops the
+        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
+        /// the TCP listener has returned.
         async fn shutdown(&mut self) {
             if let Some(quic) = self.quic.take() {
                 quic.close().await;
@@ -418,12 +418,9 @@ mod fuse_remote_tests {
                 tokio::time::timeout(Duration::from_secs(10), stopped)
                     .await
                     .expect("the gRPC server stops")
-                    .ok();
+                    .expect("the gRPC server reports how it stopped")
+                    .expect("the gRPC server stops cleanly");
             }
-            assert!(
-                tokio::net::TcpStream::connect(self.addr).await.is_err(),
-                "the port is closed"
-            );
         }
     }
 
@@ -465,7 +462,7 @@ mod fuse_remote_tests {
         .expect("quinn server start");
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
             Arc::new(lore_server::notification::local::NotificationSender::default());
         #[allow(clippy::disallowed_methods)]
@@ -507,19 +504,15 @@ mod fuse_remote_tests {
                     shutdown_rx.await.ok();
                 })
                 .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
+            let _ = stopped_tx.send(outcome.map_err(|error| error.to_string()));
         });
         for _ in 0..100 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
+            if let Ok(outcome) = stopped_rx.try_recv() {
+                panic!("test server on {addr} stopped while starting: {outcome:?}");
             }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 return Server {
                     url: format!("lore://127.0.0.1:{}", addr.port()),
-                    addr,
                     quic: Some(quic),
                     grpc_shutdown: Some(shutdown_tx),
                     grpc_stopped: Some(stopped_rx),
@@ -1088,12 +1081,13 @@ mod fuse_remote_tests {
                     panic!("an offline fetch fails");
                 };
                 assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error}");
-                // The kernel retries a failed page read once; the retry of an address whose
-                // fetch just missed its deadline fails at once, so one deadline bounds both.
+                // Nothing answers, so the first READ fails at its deadline. The kernel retries a
+                // failed page read once; the retry of an address whose fetch just missed its
+                // deadline fails at once, so one deadline bounds both.
                 let reads = fixture.reads() - reads_before;
                 assert!(reads >= 1, "the read reached the service");
                 assert!(
-                    elapsed < deadline + Duration::from_millis(1500),
+                    elapsed >= deadline && elapsed < deadline + Duration::from_millis(1500),
                     "failed after {elapsed:?} over {reads} READs, deadline {deadline:?}"
                 );
                 assert_eq!(fixture.store.content_gets(), 0);
@@ -1258,15 +1252,19 @@ mod fuse_remote_tests {
                 let (ino, address, partition) = file_root(&fixture, "big.bin").await;
                 let repository = fixture.mount.filesystem.served().repository.clone();
                 lore_revision::immutable::read(
-                    repository,
+                    repository.clone(),
                     address,
                     None,
                     lore_storage::ReadOptions::default().with_cache(),
                 )
                 .await
                 .expect("the content is fetched into the local store");
-                let store = lore_storage::write::try_acquire_in_flight(partition, address)
-                    .expect("no store of the file is in flight yet");
+                let store = lore_storage::write::try_acquire_in_flight(
+                    repository.immutable_store_ref(),
+                    partition,
+                    address,
+                )
+                .expect("no store of the file is in flight yet");
 
                 let page = worker_read_first_page(&fixture, ino)
                     .await
@@ -1287,8 +1285,17 @@ mod fuse_remote_tests {
             .scope(execution("worker-miss-in-flight"), async move {
                 let fixture = remote_fixture().await;
                 let (ino, address, partition) = file_root(&fixture, REMOTE_FILE).await;
-                let store = lore_storage::write::try_acquire_in_flight(partition, address)
-                    .expect("no store of the file is in flight yet");
+                let store = lore_storage::write::try_acquire_in_flight(
+                    fixture
+                        .mount
+                        .filesystem
+                        .served()
+                        .repository
+                        .immutable_store_ref(),
+                    partition,
+                    address,
+                )
+                .expect("no store of the file is in flight yet");
 
                 let read = worker_read_first_page(&fixture, ino).await;
                 assert_eq!(read, Err("WouldFetch".to_string()));
@@ -2787,6 +2794,7 @@ mod fuse_remote_tests {
     use lore_revision::repository::clone::CloneContext;
     use lore_revision::repository::clone::CloneOptions;
     use lore_revision::repository::clone::clone_materialize_hold;
+    use lore_revision::repository::clone::clone_onto_held_state;
     use lore_revision::repository::prefetch::TreePrefetch;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenWithNameIterator;
@@ -3459,6 +3467,110 @@ mod fuse_remote_tests {
                     .expect("recording");
                 clone.publish_and_prefetch().await;
                 clone.assert_warmed(&skipped).await;
+                clone.unmount().await;
+            })
+            .await;
+    }
+
+    /// A clone's hold reads none of the root's ignore file, and the warm-up after it reads the file
+    /// into the store, so a command run offline finds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_warm_up_after_a_hold_reads_the_ignore_file_into_the_store() {
+        skip_without_fuse!();
+        LORE_CONTEXT
+            .scope(execution("held-ignore-file"), async move {
+                let tree = vec![vec![
+                    (".loreignore".to_string(), b"*.held-warm-up\n".to_vec()),
+                    ("top.txt".to_string(), b"top".to_vec()),
+                ]];
+                let clone = vfs_clone(&tree, None, prefetch_options(TreePrefetch::Off, None)).await;
+                clone_materialize_hold(&clone.context)
+                    .await
+                    .expect("the clone publishes");
+                assert!(
+                    !clone.content_local(".loreignore").await,
+                    "the hold reads the ignore file"
+                );
+                clone.context.operation.warm_held_ignore_file().await;
+                assert!(
+                    clone.content_local(".loreignore").await,
+                    "the warm-up reads the ignore file into the store"
+                );
+                clone.unmount().await;
+            })
+            .await;
+    }
+
+    /// A clone onto a mount starts its prefetch before it reads the root's ignore file, and returns
+    /// once that read has stored the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_clone_starts_its_prefetch_before_it_reads_the_ignore_file() {
+        skip_without_fuse!();
+        LORE_CONTEXT
+            .scope(execution("held-clone-ignore-file"), async move {
+                let recording = lore_base::test_util::TempFile::with_contents(
+                    "lore-fuse-recording-",
+                    b"keep/held-clone.txt\n",
+                );
+                let mut tree = prefetch_tree();
+                tree[0].push((".loreignore".to_string(), b"*.held-clone\n".to_vec()));
+                tree[0].push((
+                    "keep/held-clone.txt".to_string(),
+                    b"held by the clone order test".to_vec(),
+                ));
+                let clone = vfs_clone(
+                    &tree,
+                    None,
+                    prefetch_options(TreePrefetch::Off, Some(recording.path())),
+                )
+                .await;
+                let mut held = Vec::new();
+                for path in [".loreignore", "keep/held-clone.txt"] {
+                    let node = clone
+                        .served_state
+                        .find_node(clone.served_repository.clone(), path)
+                        .await
+                        .expect("a served file");
+                    held.push(node.address.hash);
+                }
+                let ignore_file = held[0];
+                clone.store.hold_hashes(held);
+                let cache_task = {
+                    let mut cloned = std::pin::pin!(clone_onto_held_state(&clone.context));
+                    let asked = async {
+                        while !clone.store.has_arrived(&ignore_file) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = &mut cloned => panic!("the clone returns before the ignore file is stored"),
+                        asked = tokio::time::timeout(Duration::from_secs(10), asked) => {
+                            asked.expect("the clone asks the remote for the ignore file");
+                        }
+                    }
+                    assert!(
+                        clone.filesystem.prefetch_running(),
+                        "the prefetch starts before the ignore file is read"
+                    );
+                    clone.store.release();
+                    tokio::time::timeout(Duration::from_secs(10), cloned)
+                        .await
+                        .expect("the clone returns once the remote answers")
+                        .expect("the clone publishes")
+                        .expect("the clone caches the state's records")
+                };
+                cache_task
+                    .await
+                    .expect("the caching task")
+                    .expect("the state's records cache");
+                assert!(
+                    clone.content_local(".loreignore").await,
+                    "the ignore file is stored"
+                );
+                tokio::time::timeout(PREFETCH_WAIT, clone.filesystem.prefetch_finished())
+                    .await
+                    .expect("the prefetch finishes once the remote answers");
                 clone.unmount().await;
             })
             .await;

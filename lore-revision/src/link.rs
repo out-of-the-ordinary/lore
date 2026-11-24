@@ -399,7 +399,8 @@ pub async fn create_branch(
             &branch_stack,
         )
         .await
-        .forward::<LinkError>("Failed to create branch in linked repository")?;
+        .forward::<LinkError>("Failed to create branch in linked repository")?
+        .latest;
 
     Ok(LinkBranchOutcome {
         revision: latest,
@@ -409,13 +410,15 @@ pub async fn create_branch(
 
 /// Links a merge works on at once. Each pins deserialized revisions of its linked repository, as a
 /// history walk does, so it shares the bound measured for those.
+#[lore_macro::test_pub]
 const MAX_CONCURRENT_LINK_TASKS: usize = crate::revision::DEFAULT_HISTORY_WALK_CONCURRENCY;
 
 /// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order, stopping at the first
 /// error. A future starts no work until it is polled, so only those in flight do any.
-async fn try_join_links<T>(
-    work: Vec<impl Future<Output = Result<T, LinkError>>>,
-) -> Result<Vec<T>, LinkError> {
+#[lore_macro::test_pub]
+pub(crate) async fn try_join_links<T, E>(
+    work: Vec<impl Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, E> {
     let mut in_flight = futures::stream::FuturesOrdered::new();
     let mut results = Vec::with_capacity(work.len());
     for future in work {
@@ -464,7 +467,7 @@ pub async fn create_branches_for_merged_links(
                         .is_none_or(|(_, node)| {
                             RepositoryId::from(node.address.context) != link.repository
                         });
-                    Ok(merged_in.then_some((link, link_path)))
+                    Ok::<_, LinkError>(merged_in.then_some((link, link_path)))
                 }
             })
             .collect(),
@@ -1469,7 +1472,7 @@ pub async fn drain_link_tracker(
 /// Force-realizes specific file paths from a linked repository state at the
 /// mount path, regardless of any state-to-state diff.
 ///
-/// Restore on-disk content for `paths` (link-relative) from `link_state`
+/// Restore on-disk content for `paths` (mount-relative) from `link_state`
 /// and unlink any `~mine`/`~theirs`/`~base` sidecars at the same paths.
 ///
 /// Used during merge abort to clean up filesystem-only artifacts: marker
@@ -1478,14 +1481,14 @@ pub async fn drain_link_tracker(
 /// (sidecars aren't in any state, and marker bytes inside a file are not
 /// produced by `realize_changes` — they're produced by `realize_conflicts`).
 ///
-/// `link_path` is the link's mount path in the parent repository. Paths
-/// are mount-prefixed under it, which is how the parent's filesystem
-/// operation names them.
+/// `link_path` is the link's mount path in the parent repository, and `mounted` the node of
+/// `link_state` mounted there. `paths` are below the mount.
 pub async fn restore_link_paths_from_state(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     link_path: RelativePath,
     link_state: Arc<State>,
+    mounted: NodeID,
     paths: &[RelativePath],
 ) -> Result<(), LinkError> {
     if paths.is_empty() {
@@ -1498,7 +1501,7 @@ pub async fn restore_link_paths_from_state(
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
 
             let node_link = link_state
-                .find_node_link(link_context.clone(), link_relative.as_str())
+                .find_relative_node_link(link_context.clone(), mounted, link_relative.as_str())
                 .await
                 .forward::<LinkError>("Failed resolving link node")?;
             if !node_link.is_valid_or_root() {
@@ -1526,6 +1529,27 @@ pub async fn restore_link_paths_from_state(
         Ok(())
     })
     .await
+}
+
+/// The links of `state`'s registry, each with whether the merge in progress in `state` merged it.
+pub(crate) async fn links_and_merged(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<(LinkReference, bool)>, LinkError> {
+    let (entries, links) = tokio::try_join!(
+        state.deserialize_link_merge_state(repository.clone()),
+        state.link_list(repository),
+    )
+    .forward::<LinkError>("Failed to read the links of the merge")?;
+    Ok(links
+        .into_iter()
+        .map(|link| {
+            let merged = entries
+                .iter()
+                .any(|entry| entry.local_node == link.local_node);
+            (link, merged)
+        })
+        .collect())
 }
 
 /// Returns the absolute path of every staged link node (add, delete, or
@@ -1852,6 +1876,7 @@ async fn verify_link_pin_diff(
     link_context: Arc<RepositoryContext>,
     new_sig: Hash,
     diff: LinkPinDiff,
+    carries_modes: bool,
 ) -> Result<Arc<Vec<NodeChange>>, LinkError> {
     let LinkPinDiff { changes, current } = diff;
     if changes.is_empty() {
@@ -1875,6 +1900,7 @@ async fn verify_link_pin_diff(
             operation: operation.clone(),
             current,
             options,
+            carries_modes,
         }),
     )
     .await
@@ -1893,7 +1919,7 @@ async fn realize_link_pin_diff(
     let changes = if overwrite_local {
         diff.changes
     } else {
-        verify_link_pin_diff(operation, link_context, new_sig, diff).await?
+        verify_link_pin_diff(operation, link_context, new_sig, diff, true).await?
     };
 
     // The realize deletes before it moves, so a directory whose files move out is still occupied
@@ -2329,6 +2355,26 @@ pub async fn validate_link_message_paths(
     Ok(())
 }
 
+/// Whether `state` holds a link with its row at `path`.
+pub(crate) async fn holds_link_at(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+) -> Result<bool, LinkError> {
+    match resolve_link_at_path(state, repository.clone(), path).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.is_node_not_found()
+                || error.is_invalid_path()
+                || error.is_not_a_link()
+                || error.is_link_not_found() =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error).forward_with::<LinkError, _>(|| format!("resolving link {path}")),
+    }
+}
+
 /// Updates a link pin when only the mount path is known.
 ///
 /// Finds the module node at the mount path, then delegates to
@@ -2480,7 +2526,8 @@ impl PlannedLinkPin {
 }
 
 /// Check the working tree against what [`apply_link_pins`] realizes for `planned`, refusing where a
-/// local modification would be overwritten.
+/// local modification would be overwritten. Changes nothing in the working tree: the realize the
+/// pins' application runs verifies again, and carries the executable bits then.
 pub async fn verify_link_pins(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -2510,7 +2557,7 @@ pub async fn verify_link_pins(
         )
         .await?;
         let diff = link_pin_diff(&link_context, &pin).await?;
-        verify_link_pin_diff(operation, link_context, pin.new_signature, diff).await?;
+        verify_link_pin_diff(operation, link_context, pin.new_signature, diff, false).await?;
     }
     Ok(())
 }
@@ -2536,6 +2583,114 @@ async fn link_node_at_path(
         .forward::<LinkError>("Failed deserializing state")?;
 
     Ok(node.is_link().then_some((node_link.node, node)))
+}
+
+/// Whether `changes`, a merge's diff sorted by path, delete the link to `link_repository` at
+/// `path` of the merge's target: a delete of a link to that repository at the path or of a
+/// directory above it, a change leaving no link to that repository at the path, or one leaving no
+/// directory above it. A delete of a node of another kind leaves the link, which the current
+/// branch put in its place. The diff reports a move of the link's node or of a directory above it
+/// only for a rename in case, which carries the link to the move's destination; a move elsewhere
+/// it reports as a delete and an add, which deletes the link here.
+#[lore_macro::test_pub]
+pub(crate) fn merge_deletes_link(
+    changes: &[NodeChange],
+    path: &str,
+    link_repository: RepositoryId,
+) -> bool {
+    let links = |side: &crate::change::NodeChangeState| {
+        side.is_link() && RepositoryId::from(side.address.context) == link_repository
+    };
+    covering_paths(path).any(|(covering, at_link)| {
+        changes_at(changes, covering).any(|change| {
+            match (change.action == crate::change::FileAction::Delete, at_link) {
+                (true, true) => links(&change.from),
+                (true, false) => change.from.flags.is_directory(),
+                (false, true) => !links(&change.to),
+                (false, false) => !change.to.flags.is_directory(),
+            }
+        })
+    })
+}
+
+/// Each directory above `path` and `path` itself, outermost first, with whether it is `path`.
+fn covering_paths(path: &str) -> impl Iterator<Item = (&str, bool)> {
+    path.match_indices('/')
+        .map(|(end, _)| (&path[..end], false))
+        .chain(std::iter::once((path, true)))
+}
+
+/// The changes among `changes`, sorted by path, at `path`.
+fn changes_at<'a>(changes: &'a [NodeChange], path: &str) -> impl Iterator<Item = &'a NodeChange> {
+    let first = changes.partition_point(|change| change.path().as_str() < path);
+    changes[first..]
+        .iter()
+        .take_while(move |change| change.path().as_str() == path)
+}
+
+/// A state's link rows, read once and sorted by the node and repository each names.
+#[lore_macro::test_pub]
+pub(crate) struct LinkRows {
+    state: Arc<State>,
+    rows: Vec<LinkReference>,
+}
+
+impl LinkRows {
+    /// The rows `state` holds.
+    #[lore_macro::test_pub]
+    pub(crate) async fn read(
+        state: &Arc<State>,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Self, LinkError> {
+        let mut rows = state
+            .link_list(repository)
+            .await
+            .forward::<LinkError>("Failed to list links")?;
+        rows.sort_unstable_by_key(|row| (row.local_node, row.repository));
+        Ok(Self {
+            state: state.clone(),
+            rows,
+        })
+    }
+
+    /// The row of the link to `link_repository` at the node `local_node`.
+    fn row(&self, local_node: NodeID, link_repository: RepositoryId) -> Option<LinkReference> {
+        self.rows
+            .binary_search_by_key(&(local_node, link_repository), |row| {
+                (row.local_node, row.repository)
+            })
+            .ok()
+            .map(|index| self.rows[index])
+    }
+}
+
+/// Where `staged`, the rows of a merge's result, holds the link to `link_repository` at the node
+/// `local_node` on `branch`, as its row resolves under the parent's `parent_branch`: the path it
+/// stands at, which a move of the node or of a directory above it changes. `None` where the merge
+/// removed the link, left it on another branch, or left the node linking another repository.
+#[lore_macro::test_pub]
+pub(crate) async fn merged_link_path(
+    repository: &Arc<RepositoryContext>,
+    staged: &LinkRows,
+    local_node: NodeID,
+    link_repository: RepositoryId,
+    branch: BranchId,
+    parent_branch: BranchId,
+) -> Result<Option<RelativePath>, LinkError> {
+    if !staged
+        .row(local_node, link_repository)
+        .is_some_and(|row| row.resolve_branch(parent_branch) == branch)
+    {
+        return Ok(None);
+    }
+    let path = staged
+        .state
+        .node_path(repository.clone(), local_node)
+        .await
+        .forward::<LinkError>("Failed resolving link node path")?;
+    let path =
+        RelativePath::from_str(&path).internal_with(|| format!("Invalid link path {path}"))?;
+    Ok(Some(path))
 }
 
 /// Compare the parent's link rows across a merge and return the ones the
