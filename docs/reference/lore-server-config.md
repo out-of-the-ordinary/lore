@@ -424,6 +424,25 @@ cert_chain = "/etc/lore/tls/ca.crt"
 repository_get = true
 ```
 
+### Minimum client build
+
+`[server.client_policy]` makes the public gRPC endpoint (`[server.grpc]`) refuse clients older than a fork build. Clients announce `lore/<version>+<build>` in their `User-Agent`; with `min_build` set, the server serves only builds named `<build_prefix><N>` with `N >= min_build`. Everyone else, including clients with no Lore token or an unstamped `+local` build, gets `FAILED_PRECONDITION` with `<update_message> (client: <seen token or "unknown">, required: <prefix><min_build> or newer)`. Without `min_build` the gate is off and nothing changes. `[server.grpc_internal]` is never gated.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `min_build` | none (gate off) | Lowest accepted build number. |
+| `build_prefix` | `"ooto-main-"` | A build name must be this prefix followed by a number. |
+| `update_message` | `"This server requires a newer Lore client."` | Text returned to refused clients; put the install instructions here. |
+
+```toml
+[server.client_policy]
+min_build = 5
+update_message = "Update Lore: https://example.com/install"
+```
+
+> [!NOTE]
+> The gate sits on gRPC only. A client that already holds a storage address can still open a QUIC connection; every `lore` command that reaches storage starts with a gRPC call, so refused clients stop there.
+
 ### Authentication
 
 `[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests, and every caller holds `read`, `write`, `obliterate` and `presign` on every partition. Repository delete and branch protection, which otherwise need `owner` or `admin`, or `write` for the repository's creator, need only `write` there, since an unauthenticated caller has no identity to compare with the creator. With `[server.auth]`, `set-protected` also permits branch protection; `lore branch protect` and `lore branch unprotect` also need `write`. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.

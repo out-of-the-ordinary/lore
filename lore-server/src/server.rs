@@ -83,6 +83,7 @@ use crate::grpc::GrpcTimeouts;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
+use crate::grpc::tower::client_policy::ClientPolicy;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookRegistrationContext;
 use crate::hooks::HookRegistry;
@@ -556,6 +557,9 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
+        .with_client_policy(ClientPolicy::from_settings(
+            &settings.server.client_policy,
+        ))
         .with_token_verification(
             token_verification,
             repository_authorizer,

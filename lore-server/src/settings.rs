@@ -739,6 +739,9 @@ pub struct ServerSettings {
     pub runtime_shutdown_timeout_seconds: u16,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
+    /// Minimum client build gate on the public gRPC server; off unless `min_build` is set.
+    #[serde(default)]
+    pub client_policy: crate::grpc::tower::client_policy::ClientPolicySettings,
     /// Disk space monitoring for the local store paths.
     #[serde(default)]
     pub local_store_monitor: LocalStoreMonitorSettings,

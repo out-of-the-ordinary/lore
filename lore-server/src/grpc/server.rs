@@ -26,6 +26,9 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
+
+use crate::grpc::tower::client_policy::ClientPolicy;
+use crate::grpc::tower::client_policy::ClientPolicyLayer;
 use serde::Deserialize;
 use tonic::service::Routes;
 use tonic::transport::Certificate;
@@ -82,20 +85,23 @@ type GrpcRouter = tonic::transport::server::Router<
     Stack<
         MalformedRequestLayer,
         Stack<
-            GrpcResponseTraceLayer,
+            ClientPolicyLayer,
             Stack<
-                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+                GrpcResponseTraceLayer,
                 Stack<
-                    LoreTracingLayer,
+                    ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                     Stack<
+                        LoreTracingLayer,
                         Stack<
-                            TraceLayer<
-                                SharedClassifier<GrpcErrorsAsFailures>,
-                                MakeCorrelationIdSpan,
+                            Stack<
+                                TraceLayer<
+                                    SharedClassifier<GrpcErrorsAsFailures>,
+                                    MakeCorrelationIdSpan,
+                                >,
+                                CorrelationIdLayer,
                             >,
-                            CorrelationIdLayer,
+                            Stack<CoreHopLayer, tower::layer::util::Identity>,
                         >,
-                        Stack<CoreHopLayer, tower::layer::util::Identity>,
                     >,
                 >,
             >,
@@ -618,6 +624,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            client_policy: None,
         })
     }
 }
@@ -642,9 +649,16 @@ pub struct MaybeJwtVerifier {
     service_settings: GrpcPublicServicesSettings,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+    client_policy: Option<Arc<ClientPolicy>>,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
+    /// Refuse clients below the configured minimum build; `None` leaves the gate off.
+    pub fn with_client_policy(mut self, client_policy: Option<Arc<ClientPolicy>>) -> Self {
+        self.0.client_policy = client_policy;
+        self
+    }
+
     fn make_lock_service(
         settings: &ServiceSettings,
         inner: LoreLockService,
@@ -734,6 +748,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
             .layer(GrpcResponseTraceLayer {})
+            .layer(ClientPolicyLayer::new(self.0.client_policy))
             // Innermost: the layers above must observe the reclassified status.
             .layer(MalformedRequestLayer::new(self.0.user_agent_filter))
             // Empty routes turn the `Server` into a `Router` without mounting

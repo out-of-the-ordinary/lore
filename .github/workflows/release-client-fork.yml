@@ -51,6 +51,14 @@ jobs:
           key: release-client-${{ matrix.triple }}
       - name: Build
         run: cargo build --release --locked -p lore-client --bin lore
+      - name: Stamp build name
+        # The binary reports <cargo version>+<tag>, e.g. 0.14.1-nightly+ooto-main-5; servers with
+        # [server.client_policy] min_build read that from the gRPC User-Agent. lore-stamp is built
+        # in its own target dir so the release build cache stays intact.
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          CARGO_TARGET_DIR=target/stamp cargo run --quiet --release --locked \
+            -p lore-base --bin lore-stamp -- --build "$TAG" "target/release/lore$ext"
       - name: Package
         id: pkg
         run: |
