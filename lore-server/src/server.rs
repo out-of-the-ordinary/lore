@@ -1409,6 +1409,7 @@ async fn create_local_store(
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
+            min_free_bytes: settings.min_free_bytes,
         },
     )
     .await

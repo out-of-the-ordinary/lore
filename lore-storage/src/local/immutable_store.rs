@@ -683,6 +683,8 @@ pub struct LocalImmutableStore {
     /// load-triggered automatic GC. Shared (by `Arc` clone) with this store's
     /// packstores. See [`crate::maintenance::GcCounters`].
     gc_counters: Arc<crate::maintenance::GcCounters>,
+    /// The last reading behind `settings.min_free_bytes`.
+    write_room: WriteRoom,
 
     #[cfg(feature = "failure_generator")]
     failure_generator: LocalImmutableStoreFailureGenerator,
@@ -765,6 +767,11 @@ pub struct ImmutableStoreSettings {
     /// Reuse the in-memory state across holds of the store's flock when its epoch is
     /// unchanged, rather than reloading at the first claim after a release. Default is `false`.
     pub reuse_state_across_holds: bool,
+    /// Refuse to write a payload while the volume holding the store has fewer than this many
+    /// bytes available, or while the packstores hold at least twice the store's `max_size`.
+    /// `max_size` alone only triggers compaction, it does not bound the store; this does, for a
+    /// cache that must never fill its volume. `0` is off, and is the default.
+    pub min_free_bytes: u64,
 }
 
 impl Default for ImmutableStoreSettings {
@@ -784,7 +791,41 @@ impl Default for ImmutableStoreSettings {
             initial_fan_out_level: 1,
             fan_out_threshold: crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             reuse_state_across_holds: false,
+            min_free_bytes: 0,
         }
+    }
+}
+
+/// How often the volume's free space and the packstores' size are read for
+/// [`ImmutableStoreSettings::min_free_bytes`], and how often a refusal is logged.
+const WRITE_ROOM_CHECK_MILLIS: u64 = 1000;
+const WRITE_ROOM_WARN_MILLIS: u64 = 60 * 1000;
+
+/// What [`ImmutableStoreSettings::min_free_bytes`] last found, so that the readings behind it are
+/// taken at most once per [`WRITE_ROOM_CHECK_MILLIS`] however many writes ask.
+#[derive(Default)]
+struct WriteRoom {
+    /// Unix time in milliseconds before which the last reading stands.
+    next_check: AtomicU64,
+    /// Unix time in milliseconds before which a refusal is not logged again.
+    next_warn: AtomicU64,
+    /// Whether the last reading found no room.
+    refuse: AtomicBool,
+}
+
+impl WriteRoom {
+    /// Claim `slot` for the caller if its time has come, pushing it `interval` ahead.
+    fn claim(slot: &AtomicU64, now: u64, interval: u64) -> bool {
+        let due = slot.load(atomic::Ordering::Relaxed);
+        now >= due
+            && slot
+                .compare_exchange(
+                    due,
+                    now + interval,
+                    atomic::Ordering::Relaxed,
+                    atomic::Ordering::Relaxed,
+                )
+                .is_ok()
     }
 }
 
@@ -2365,6 +2406,7 @@ impl LocalImmutableStore {
             deserialized_all: AtomicBool::new(false),
             instruments: StoreInstruments::default(),
             gc_counters,
+            write_room: WriteRoom::default(),
             #[cfg(feature = "failure_generator")]
             failure_generator,
         };
@@ -3080,6 +3122,8 @@ impl LocalImmutableStore {
         payload: Bytes,
         force: bool,
     ) -> Result<StoreOutcome, LocalImmutableStoreError> {
+        self.ensure_write_room().await?;
+        let payload_size = payload.len() as u64;
         let group = &self.group[address.hash.data()[0] as usize];
         let _gate = group.payload_gate.hold();
         let written = group
@@ -3089,6 +3133,7 @@ impl LocalImmutableStore {
             .forward::<LocalImmutableStoreError>(
                 "Failed storing immutable data, packstore write failed",
             )?;
+        self.gc_counters.note_written(payload_size);
         #[cfg(feature = "test-util")]
         crate::test_util::pause_point(crate::test_util::PausePoint::Written).await;
         self.store_entry(
@@ -3099,6 +3144,48 @@ impl LocalImmutableStore {
             force,
         )
         .await
+    }
+
+    /// Refuse a payload write when [`ImmutableStoreSettings::min_free_bytes`] is set and the
+    /// volume has less than that available, or the packstores hold at least twice `max_size`.
+    /// The readings are refreshed at most once per [`WRITE_ROOM_CHECK_MILLIS`] and a refusal is
+    /// logged at most once per [`WRITE_ROOM_WARN_MILLIS`]. A store without a path is never refused.
+    async fn ensure_write_room(&self) -> Result<(), LocalImmutableStoreError> {
+        let min_free = self.settings.min_free_bytes;
+        let Some(path) = self.path.as_deref().filter(|_| min_free > 0) else {
+            return Ok(());
+        };
+        let now = Self::now_millis();
+        if WriteRoom::claim(&self.write_room.next_check, now, WRITE_ROOM_CHECK_MILLIS) {
+            let max_size = self.gc_counters.max_size() as usize;
+            let below_free = lore_io::clone::space_of(path)
+                .is_ok_and(|space| space.available < min_free);
+            let over_size = !below_free
+                && max_size > 0
+                && self.measure_packstores().await >= max_size.saturating_mul(2);
+            self.write_room
+                .refuse
+                .store(below_free || over_size, atomic::Ordering::Relaxed);
+        }
+        if !self.write_room.refuse.load(atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        if WriteRoom::claim(&self.write_room.next_warn, now, WRITE_ROOM_WARN_MILLIS) {
+            lore_base::lore_warn!(
+                "Immutable store at {} refuses writes, cache volume below min_free_bytes {min_free} or store at twice its max size",
+                path.display()
+            );
+        }
+        Err(LocalImmutableStoreError::internal(
+            "cache volume below min_free_bytes",
+        ))
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     /// Insert or update the entry for `address` under its bucket's write lock. An entry needing a
@@ -4332,12 +4419,15 @@ impl LocalImmutableStore {
                 .compaction
                 .total_size
                 .record(total_size as u64, &[]);
+            // What the write path counts against `max_size` starts over from this reading.
+            self.gc_counters.set_size(total_size as u64);
             if total_size < max_size {
                 lore_base::lore_debug!(
                     "Packstore compactor skipping, current size {total_size} is below threshold {max_size}"
                 );
                 return Ok(None);
             }
+            self.gc_counters.set_size(target_size as u64);
             lore_base::lore_debug!(
                 "Packstore compactor running, current size {total_size} is above threshold {max_size} - targeting {target_size} bytes ({target_percentage}% of max size)"
             );

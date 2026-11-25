@@ -1191,3 +1191,31 @@ async fn compact_bucket() {
     assert_eq!(compacted_size, mid_buffer.len() + greater_buffer.len());
     assert!(!referenced);
 }
+
+/// Bytes written past `max_size` fire one compaction pass, however many writes follow, and the
+/// trigger is armed again once that pass has ended.
+#[tokio::test]
+async fn note_written_fires_compaction_once_and_rearms() {
+    let dir = generate_tempdir();
+    let store = create_test_store(Some(dir.to_path_buf())).await;
+    let counters = store.gc_counters().expect("a local store has counters");
+    counters.set_caps(1000, 0, false);
+
+    counters.note_written(400);
+    assert_eq!(counters.compaction_fires(), 0, "below max_size");
+    counters.note_written(700);
+    counters.note_written(700);
+    assert_eq!(counters.compaction_fires(), 1, "one crossing, one pass");
+
+    // The pass measures the store, finds it empty and ends, which arms the trigger again.
+    for _ in 0..1000 {
+        counters.note_written(0);
+        if !counters.compaction_pending() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!counters.compaction_pending(), "the pass ended");
+    counters.note_written(1500);
+    assert_eq!(counters.compaction_fires(), 2, "next crossing fires again");
+}

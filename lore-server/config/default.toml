@@ -141,6 +141,10 @@ mode = "local"
 
 [immutable_store.local]
 flush_delay_seconds = 10
+# `max_size` only triggers compaction, it does not cap the store. For a cache that must not fill
+# its volume, also refuse writes while the volume has less than this many bytes available, or the
+# store holds twice `max_size` (0 = off):
+# min_free_bytes = 10737418240
 
 [mutable_store.local]
 flush_delay_seconds = 10

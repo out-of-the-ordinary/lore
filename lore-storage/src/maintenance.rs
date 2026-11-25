@@ -210,14 +210,20 @@ pub async fn gc(
             }
         }
         lore_base::lore_debug!("Store compactor done");
+        // Armed again, so the next crossing of the cap fires a pass of its own.
+        if let Some(counters) = store.gc_counters() {
+            counters.rearm_compaction();
+        }
     }
 }
 
+const MEASURED_UNSET: u64 = u64::MAX;
+
 /// Per-store running totals, collected purely as a byproduct of LOADING data from
 /// disk — packstore sizes in [`crate::packstore::PackStore::resume`] and bucket
-/// fragment counts in `ImmutableStoreBucket::deserialize`. Nothing on the write path
-/// touches these; the periodic background tasks remain the authoritative full scan
-/// for long-lived processes.
+/// fragment counts in `ImmutableStoreBucket::deserialize`. The write path adds only the bytes it
+/// writes, see [`GcCounters::note_written`]; the periodic background tasks remain the
+/// authoritative full scan for long-lived processes.
 ///
 /// Because loading only ever *adds*, the totals are a lower bound on the true store
 /// size/count: if the loaded subset alone exceeds a cap, the store is definitely over
@@ -231,6 +237,10 @@ pub async fn gc(
 /// counters. Its caps are also the limits the store's periodic evictor and compactor enforce.
 pub struct GcCounters {
     total_size: AtomicU64,
+    /// The size a compaction pass last measured or aimed for, [`MEASURED_UNSET`] before one ran.
+    measured: AtomicU64,
+    /// Bytes written since `measured` was set.
+    written: AtomicU64,
     fragment_count: AtomicUsize,
     /// Compaction cap in bytes; 0 disables compaction.
     max_size: AtomicU64,
@@ -238,6 +248,9 @@ pub struct GcCounters {
     max_capacity: AtomicUsize,
     sync_data: AtomicBool,
     compaction_fired: AtomicBool,
+    /// Compaction passes fired by a crossing of `max_size`. Test builds only.
+    #[cfg(feature = "test-util")]
+    compaction_fires: AtomicUsize,
     eviction_fired: AtomicBool,
     evictor_spawned: AtomicBool,
     compactor_spawned: AtomicBool,
@@ -250,11 +263,15 @@ impl Default for GcCounters {
     fn default() -> Self {
         Self {
             total_size: AtomicU64::new(0),
+            measured: AtomicU64::new(MEASURED_UNSET),
+            written: AtomicU64::new(0),
             fragment_count: AtomicUsize::new(0),
             max_size: AtomicU64::new(0),
             max_capacity: AtomicUsize::new(0),
             sync_data: AtomicBool::new(false),
             compaction_fired: AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            compaction_fires: AtomicUsize::new(0),
             eviction_fired: AtomicBool::new(false),
             evictor_spawned: AtomicBool::new(false),
             compactor_spawned: AtomicBool::new(false),
@@ -317,8 +334,68 @@ impl GcCounters {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
+            #[cfg(feature = "test-util")]
+            self.compaction_fires.fetch_add(1, Ordering::Relaxed);
             self.clone().fire(true);
         }
+    }
+
+    /// Account for `bytes` of payload just written to a packstore; fire one compaction pass if
+    /// the running total crosses `max_size`. The trigger stays spent until the pass it started
+    /// ends, see [`Self::rearm_compaction`], so one crossing fires one pass.
+    ///
+    /// The total is what a compaction pass last measured, or what loading counted before any
+    /// pass ran, plus what has been written since. Kept apart from the loaded total, which a
+    /// packstore takes back out as it closes.
+    pub fn note_written(self: &Arc<Self>, bytes: u64) {
+        let max = self.max_size.load(Ordering::Relaxed);
+        if max == 0 || bytes == 0 {
+            return;
+        }
+        let written = self.written.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let measured = match self.measured.load(Ordering::Relaxed) {
+            MEASURED_UNSET => self.total_size.load(Ordering::Relaxed),
+            measured => measured,
+        };
+        if measured.saturating_add(written) > max
+            && self
+                .compaction_fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            #[cfg(feature = "test-util")]
+            self.compaction_fires.fetch_add(1, Ordering::Relaxed);
+            self.clone().fire(true);
+        }
+    }
+
+    /// Start counting writes from `bytes`, a measurement of the packstores or the size a pass is
+    /// about to compact them to.
+    pub fn set_size(&self, bytes: u64) {
+        self.measured.store(bytes, Ordering::Relaxed);
+        self.written.store(0, Ordering::Relaxed);
+    }
+
+    /// Let the next crossing of `max_size` fire a pass again, once the pass it fired has ended.
+    pub fn rearm_compaction(&self) {
+        self.compaction_fired.store(false, Ordering::Release);
+    }
+
+    /// The compaction cap in bytes, 0 when compaction is off.
+    pub fn max_size(&self) -> u64 {
+        self.max_size.load(Ordering::Relaxed)
+    }
+
+    /// Whether a fired compaction pass has yet to end. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn compaction_pending(&self) -> bool {
+        self.compaction_fired.load(Ordering::Acquire)
+    }
+
+    /// How many compaction passes a crossing of `max_size` has fired. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn compaction_fires(&self) -> usize {
+        self.compaction_fires.load(Ordering::Relaxed)
     }
 
     /// Take `bytes` of packstore data back out of the running total, for a packstore

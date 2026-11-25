@@ -10772,3 +10772,73 @@ mod eviction_flush_delay {
         );
     }
 }
+
+/// A store whose volume has less room than `min_free_bytes` refuses a payload and keeps nothing of
+/// it, and one with `min_free_bytes` off stores as it always did.
+#[tokio::test]
+async fn put_is_refused_below_min_free_bytes() {
+    use lore_storage::immutable_store::ImmutableStore as _;
+
+    let partition = Partition::from([0x31; 16]);
+    let payload = b"a payload the volume has no room for";
+    let address = Address {
+        hash: hash::hash_slice(payload),
+        context: Context::from([0x32; 16]),
+    };
+
+    let dir = lore_base::test_util::TempDir::new("lore-storage-min-free-");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            min_free_bytes: u64::MAX,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let refused = try_put_payload(
+        &store,
+        partition,
+        address.context,
+        payload,
+        false,
+        false,
+    )
+    .await;
+    assert!(refused.is_err(), "a put below min_free_bytes must fail");
+    assert!(
+        store.clone().get(partition, address).await.is_err(),
+        "a refused put must store no payload"
+    );
+
+    let dir = lore_base::test_util::TempDir::new("lore-storage-min-free-off-");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .expect("store opens");
+    put_payload(&store, partition, address.context, payload, false).await;
+    assert!(store.clone().get(partition, address).await.is_ok());
+}
+
+/// With `min_free_bytes` set, a store holding twice its `max_size` refuses further payloads once
+/// the size reading, taken at most once per second, has caught up.
+#[tokio::test]
+async fn put_is_refused_at_twice_max_size() {
+    let dir = lore_base::test_util::TempDir::new("lore-storage-twice-max-");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            min_free_bytes: 1,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    store.set_gc_caps(1000, 0, false);
+    let partition = Partition::from([0x33; 16]);
+    let context = Context::from([0x34; 16]);
+    put_payload(&store, partition, context, &[7u8; 4096], false).await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let refused = try_put_payload(&store, partition, context, &[8u8; 64], false, false).await;
+    assert!(refused.is_err(), "a store at twice max_size must refuse");
+}

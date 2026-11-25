@@ -997,6 +997,10 @@ pub struct LocalImmutableStoreSettings {
     pub target_capacity_percentage: Option<usize>,
     pub target_size_percentage: Option<usize>,
     pub compaction_parallel_groups: Option<usize>,
+    /// Refuse writes while the volume has fewer bytes available, or the store holds twice
+    /// `max_size`. 0 (the default) is off.
+    #[serde(default)]
+    pub min_free_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
