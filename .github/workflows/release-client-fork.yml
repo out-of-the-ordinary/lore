@@ -45,7 +45,7 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc --no-progress -y
       - name: Install Rust
-        run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-client-${{ matrix.triple }}
