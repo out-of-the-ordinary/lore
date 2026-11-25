@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 use std::ffi::OsString;
 use std::path::PathBuf;
+#[cfg(target_family = "unix")]
 use std::process::Command;
+#[cfg(target_family = "unix")]
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(target_family = "unix")]
 use std::time::Duration;
 
 use lore::remote::service_process::*;
@@ -299,8 +302,7 @@ fn an_accepted_stop_is_never_cleared_by_a_racing_start() {
 fn session_of(pid: u32) -> i32 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
     stat.rsplit_once(')')
-        .map(|(_comm, rest)| rest)
-        .unwrap_or_default()
+        .map_or_default(|(_comm, rest)| rest)
         .split_whitespace()
         .nth(3)
         .and_then(|session| session.parse().ok())

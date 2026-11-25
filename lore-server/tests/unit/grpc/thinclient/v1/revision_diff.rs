@@ -26,6 +26,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -204,6 +205,7 @@ async fn push_linked_revision(
         .expect("serialize state");
     branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -297,6 +299,7 @@ async fn identical_revisions_return_header_only() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev = push_revision(
@@ -354,6 +357,7 @@ async fn same_branch_two_way_diff_streams_changes_no_base() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev1 = push_revision(
@@ -434,6 +438,7 @@ async fn branch_point_of_other_is_two_way() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let main_rev = push_revision(
@@ -519,6 +524,7 @@ async fn three_way_diff_populates_base_and_emits_conflict() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let main_rev = push_revision(
@@ -623,6 +629,7 @@ async fn unknown_signature_returns_not_found() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(&repository_context, main, Hash::default(), 1, &[]).await
@@ -664,6 +671,7 @@ async fn zero_from_signature_diffs_as_two_way_showing_all_adds() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(
@@ -737,6 +745,7 @@ async fn zero_to_signature_diffs_as_two_way_showing_all_adds() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(
@@ -842,6 +851,7 @@ async fn identifier_query_resolves_through_diff() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev1 = push_revision(
@@ -915,6 +925,7 @@ async fn three_way_clean_merge_has_base_but_no_conflicts() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // Common ancestor on main; two sibling branches change
         // disjoint files (no overlap → no conflict).
@@ -1083,6 +1094,7 @@ async fn diff_over_merge_history(
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (b_rev, merge_rev) = push_branch_merged_into_main(&repository_context).await;
 
@@ -1434,6 +1446,7 @@ async fn touched_link_is_announced_to_every_caller() {
             immutable_store.clone(),
             mutable_store.clone(),
             linked_id,
+            allow_all_repositories(),
         ));
         let (pin, sub) = write_linked_revision(&linked, 1, b"v1").await;
         let (same_content, _) = write_linked_revision(&linked, 2, b"v1").await;
@@ -1488,6 +1501,7 @@ async fn touched_link_is_announced_to_every_caller() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let revisions = push_link_pins(&repository_context, linked_id, pins).await;
             for &(from, to) in diffs {
@@ -1515,4 +1529,150 @@ async fn touched_link_is_announced_to_every_caller() {
         }
     }))
     .await;
+}
+
+mod cancelled_request {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    /// Runs the diff of `from` against `to` as a cancelled request, answering what the stream
+    /// carried.
+    async fn cancelled_diff(
+        repository: RepositoryId,
+        immutable_store: Arc<dyn ImmutableStore>,
+        mutable_store: Arc<dyn MutableStore>,
+        from: Hash,
+        to: Hash,
+    ) -> Vec<Result<RevisionDiffResponse, Status>> {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        with_request_cancellation(cancellation, async move {
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(from.into()),
+                    QueryTo::SignatureTo(to.into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                allow_all(),
+                RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("the revisions resolve before the diff starts");
+            collect(response).await
+        })
+        .await
+    }
+
+    /// Asserts the stream ended in CANCELLED without carrying a change or conflict.
+    fn assert_cancelled_without_changes(items: &[Result<RevisionDiffResponse, Status>]) {
+        let (last, earlier) = items.split_last().expect("the stream carries an answer");
+        let status = last.as_ref().expect_err("the stream ends in an error");
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+        for item in earlier {
+            let item = item.as_ref().expect("only the last item is an error");
+            assert!(
+                matches!(item.payload, Some(Payload::Header(_))),
+                "a cancelled diff carries no changes, got {item:?}",
+            );
+        }
+    }
+
+    /// A cancelled 2-way diff ends its stream in CANCELLED rather than diffing.
+    #[tokio::test]
+    async fn a_cancelled_two_way_diff_answers_cancelled() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let rev1 = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("a.txt", b"v1".as_slice())],
+            )
+            .await;
+            let rev2 = push_revision(
+                &repository_context,
+                main,
+                rev1,
+                2,
+                &[("a.txt", b"v1".as_slice()), ("b.txt", b"new".as_slice())],
+            )
+            .await;
+
+            let items =
+                cancelled_diff(repository, immutable_store, mutable_store, rev1, rev2).await;
+            assert_cancelled_without_changes(&items);
+        }))
+        .await;
+    }
+
+    /// A cancelled 3-way diff ends its stream in CANCELLED rather than diffing.
+    #[tokio::test]
+    async fn a_cancelled_three_way_diff_answers_cancelled() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let main_rev = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("conflict.txt", b"base".as_slice())],
+            )
+            .await;
+            let mut tips = Vec::new();
+            for (name, content) in [("branch_a", b"by-a".as_slice()), ("branch_b", b"by-b")] {
+                let branch_id = create_branch(
+                    &repository_context,
+                    name,
+                    vec![BranchPoint {
+                        branch: main,
+                        revision: main_rev,
+                    }],
+                )
+                .await;
+                tips.push(
+                    push_revision(
+                        &repository_context,
+                        branch_id,
+                        main_rev,
+                        1,
+                        &[("conflict.txt", content)],
+                    )
+                    .await,
+                );
+            }
+
+            let items =
+                cancelled_diff(repository, immutable_store, mutable_store, tips[0], tips[1]).await;
+            assert_cancelled_without_changes(&items);
+        }))
+        .await;
+    }
 }

@@ -527,12 +527,15 @@ impl QuicService for StorageService {
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
         if let Some(action) = request.required_action()
-            && connection_permits(&context, self.repository_authorizer.as_ref(), action).await
+            && connection_permits(&context, self.repository_authorizer.as_ref(), action)
+                .await
+                .map_err(MessageHandleError::from_authorization)?
                 == Some(false)
             && match request.alternative_action() {
                 Some(alternative) => {
                     connection_permits(&context, self.repository_authorizer.as_ref(), alternative)
                         .await
+                        .map_err(MessageHandleError::from_authorization)?
                         == Some(false)
                 }
                 None => true,

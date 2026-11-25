@@ -14,6 +14,7 @@ use lore_revision::metadata::MetadataType;
 use lore_revision::metadata::repository::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash;
 use tonic::Request;
 use tonic::Response;
@@ -21,6 +22,8 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
+use crate::authnz::repository_authorizer::is_denial;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -134,20 +137,25 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id.into(),
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
             let token = get_verified_token(&extensions);
-            let write = authorizer
+            let write = match authorizer
                 .check_repository_access(token.as_ref(), repository_id.into(), Action::Write)
                 .await
-                .is_ok();
+            {
+                Ok(()) => true,
+                Err(status) if is_denial(&status) => false,
+                Err(status) => return Err(status),
+            };
             if !write {
                 authorizer
                     .check_repository_access(token.as_ref(), repository_id.into(), Action::Label)
                     .await
-                    .map_err(|_err| no_repository_access_status())?;
+                    .map_err(flatten_denial)?;
             }
 
             // Deserialize current and proposed blobs for validation

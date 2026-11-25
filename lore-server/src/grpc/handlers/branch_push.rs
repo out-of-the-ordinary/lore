@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -16,7 +19,6 @@ use lore_proto::BranchPushResponse;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::branch::LATEST;
-use lore_revision::branch::PROTECT;
 use lore_revision::branch::push;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::BranchId;
@@ -26,8 +28,12 @@ use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::repository::prefetch::PrefetchCounts;
+use lore_revision::repository::prefetch::PrefetchTracker;
+use lore_revision::repository::prefetch::prefetch_changed_node_blocks;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
@@ -58,8 +64,10 @@ use tracing::warn;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache::revision::store_history_step;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -139,6 +147,14 @@ static FAST_FORWARD_MERGE_CHANGES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         ],
     )
 });
+
+static PREFETCH_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("prefetch_duration"));
+
+/// The most node blocks a state a push's prefetch compares may have. A pushed state's block count is
+/// whatever its client stored, so a prefetch comparing a state of more is skipped, and the walk it
+/// runs beside reads each block as it reaches it.
+const MAX_PREFETCH_BLOCKS: usize = 262_144;
 
 /// A push that takes at least this long is logged at info with its breakdown, as is every
 /// cancelled or failed push.
@@ -250,6 +266,27 @@ const _: () = {
     }
 };
 
+/// The error a push, or its verification, returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushFailure {
+    /// It returned without an error.
+    None,
+    /// It returned an error status other than `CANCELLED`.
+    Error,
+    /// It returned `CANCELLED`.
+    Cancelled,
+}
+
+impl PushFailure {
+    fn of<T>(result: &Result<T, Status>) -> Self {
+        match result {
+            Ok(_) => PushFailure::None,
+            Err(status) if status.code() == tonic::Code::Cancelled => PushFailure::Cancelled,
+            Err(_) => PushFailure::Error,
+        }
+    }
+}
+
 /// How a push timed by [`PushReport`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -262,9 +299,9 @@ pub enum PushOutcome {
     /// authorization or for a zero revision, or it panicked. A request without a valid repository
     /// header is rejected before its report exists and is not recorded.
     Error,
-    /// The handler future was dropped before it returned, such as by the handler timeout or a
-    /// server shutting down. A client that disconnects does not drop it: the handler runs on to
-    /// completion on the core runtime.
+    /// The push stopped because nobody waited for it any more: the client went away or the
+    /// handler timeout elapsed. Also a handler future dropped before it returned, such as by a
+    /// server shutting down.
     Cancelled,
 }
 
@@ -272,14 +309,14 @@ impl PushOutcome {
     /// How something that returned, or was dropped before it returned, ended. A push declined
     /// and answered with an error status is declined.
     #[lore_macro::test_pub]
-    fn of(finished: bool, declined: bool, errored: bool) -> Self {
-        match (finished, declined, errored) {
+    fn of(finished: bool, declined: bool, failure: PushFailure) -> Self {
+        match (finished, declined, failure) {
             // Dropped while unwinding: it failed, rather than being cut off from outside.
             (false, _, _) if std::thread::panicking() => PushOutcome::Error,
-            (false, _, _) => PushOutcome::Cancelled,
+            (false, _, _) | (true, false, PushFailure::Cancelled) => PushOutcome::Cancelled,
             (true, true, _) => PushOutcome::Declined,
-            (true, false, true) => PushOutcome::Error,
-            (true, false, false) => PushOutcome::Completed,
+            (true, false, PushFailure::Error) => PushOutcome::Error,
+            (true, false, PushFailure::None) => PushOutcome::Completed,
         }
     }
 
@@ -318,10 +355,14 @@ pub struct PushReport {
     exist_started: Option<Instant>,
     /// When the verification returned, with success or an error.
     verified_at: Option<Instant>,
-    verification_failed: bool,
-    errored: bool,
+    verification_failure: PushFailure,
+    failure: PushFailure,
     /// Whether the push left the head where it was for the client to resolve.
     declined: bool,
+    /// The prefetch run beside the verification's tree walk.
+    verify_prefetch: Arc<PrefetchTracker>,
+    /// The prefetches run beside each fast-forward merge's diff.
+    merge_prefetch: Arc<PrefetchTracker>,
 }
 
 /// A snapshot of a [`PushReport`], with the running phase counted up to the moment it was taken.
@@ -346,6 +387,12 @@ pub struct PushSummary {
     /// The time the verification's existence checks took, counted up to the snapshot while they
     /// run. `None` if they never started.
     pub verify_exist: Option<Duration>,
+    /// What the prefetch beside the verification's walk did. A fetch still running at the snapshot
+    /// is counted only once it ends.
+    pub verify_prefetch: PrefetchCounts,
+    /// What the prefetches beside the fast-forward merge's diffs did, one for each attempt at the
+    /// merge. A fetch still running at the snapshot is counted only once it ends.
+    pub merge_prefetch: PrefetchCounts,
 }
 
 impl PushSummary {
@@ -376,9 +423,11 @@ impl PushReport {
             collect_started: None,
             exist_started: None,
             verified_at: None,
-            verification_failed: false,
-            errored: false,
+            verification_failure: PushFailure::None,
+            failure: PushFailure::None,
             declined: false,
+            verify_prefetch: Arc::default(),
+            merge_prefetch: Arc::default(),
         }
     }
 
@@ -398,15 +447,15 @@ impl PushReport {
     /// Runs `body` in `execution` with the report, and marks the push completed or errored by
     /// what `body` returns. A future dropped before then drops the report unfinished, which
     /// records the push as cancelled.
-    pub async fn run<T, E>(
+    pub async fn run<T>(
         mut self,
         execution: Arc<ExecutionContext>,
-        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, E>,
-    ) -> Result<T, E> {
+        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, Status>,
+    ) -> Result<T, Status> {
         LORE_CONTEXT
             .scope(execution, async move {
                 let result = body(&mut self).await;
-                self.errored = result.is_err();
+                self.failure = PushFailure::of(&result);
                 self.finish();
                 result
             })
@@ -430,7 +479,7 @@ impl PushReport {
             add_phase_time(&mut phase_durations, self.phase, now - self.phase_started);
             now
         };
-        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.errored);
+        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.failure);
         let verify_end = self.verified_at.unwrap_or(end);
         let verify_collect = self
             .collect_started
@@ -449,6 +498,8 @@ impl PushReport {
             peak_metadata_reads_in_flight: self.store_requests.peak_metadata_reads_in_flight(),
             verify_collect,
             verify_exist,
+            verify_prefetch: self.verify_prefetch.counts(),
+            merge_prefetch: self.merge_prefetch.counts(),
         }
     }
 
@@ -499,6 +550,8 @@ impl Drop for PushReport {
         if let Some(changes) = summary.fast_forward_merge_changes {
             FAST_FORWARD_MERGE_CHANGES.record(changes, &handler_and_outcome);
         }
+        record_prefetch("verify", &summary.verify_prefetch, &handler_and_outcome);
+        record_prefetch("merge", &summary.merge_prefetch, &handler_and_outcome);
 
         if cancelled
             || summary.outcome == PushOutcome::Error
@@ -529,8 +582,52 @@ impl Drop for PushReport {
                 peak_metadata_reads_in_flight = summary.peak_metadata_reads_in_flight,
                 num_collected_addresses = self.collected_addresses,
                 num_concurrent_query_batches = self.concurrent_query_batches,
+                verify_prefetch = prefetch_field(&summary.verify_prefetch),
+                merge_prefetch = prefetch_field(&summary.merge_prefetch),
                 "Slow, cancelled or failed branch push"
             );
+        }
+    }
+}
+
+/// The prefetch counts of one phase for the slow push log, `None` where the phase ran none.
+fn prefetch_field(counts: &PrefetchCounts) -> Option<tracing::field::DisplayValue<PrefetchCounts>> {
+    (counts.runs != 0).then(|| tracing::field::display(*counts))
+}
+
+/// Records how long one phase's prefetches took, where every one of them finished.
+fn record_prefetch(
+    phase: &'static str,
+    counts: &PrefetchCounts,
+    handler_and_outcome: &[KeyValue; 2],
+) {
+    if counts.runs == 0 || counts.finished != counts.runs {
+        return;
+    }
+    let [handler, outcome] = handler_and_outcome.clone();
+    PREFETCH_DURATION.record(
+        counts.elapsed.as_secs_f64() * 1000.,
+        &[KeyValue::new("phase", phase), handler, outcome],
+    );
+}
+
+/// Runs `work` with `prefetch`, where there is one, beside it and answers `work`'s output as soon
+/// as there is one. Dropping the prefetch then stops it comparing and starting fetches; those it
+/// started run to their end.
+async fn beside_prefetch<T>(
+    mut work: Pin<&mut impl Future<Output = T>>,
+    prefetch: Option<Pin<&mut impl Future<Output = ()>>>,
+) -> T {
+    let Some(mut prefetch) = prefetch else {
+        return work.await;
+    };
+    let mut prefetching = true;
+    loop {
+        tokio::select! {
+            // The prefetch is polled first so it has started before the work can finish.
+            biased;
+            () = prefetch.as_mut(), if prefetching => prefetching = false,
+            output = work.as_mut() => return output,
         }
     }
 }
@@ -539,7 +636,7 @@ impl PushReport {
     /// Records the verification's timings, labelled with how the verification itself ended, and
     /// its store requests.
     fn record_verification(&self, summary: &PushSummary, handler: &KeyValue) {
-        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failed);
+        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failure);
         let completed_with_nothing_collected =
             outcome == PushOutcome::Completed && self.collected_addresses.unwrap_or(0) == 0;
         let attributes = [handler.clone(), KeyValue::new("outcome", outcome.label())];
@@ -605,6 +702,7 @@ pub async fn handler(
     request: Request<BranchPushRequest>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
@@ -644,10 +742,13 @@ pub async fn handler(
                 "Handling branch push request",
             );
 
+            // The fast-forward merge must build the same revision whoever pushes; narrowing its
+            // diff to the pusher's reads would change it.
             let repository = Arc::new(RepositoryContext::new_server_context(
                 immutable_store,
                 mutable_store,
                 repository,
+                allow_all_repositories(),
             ));
 
             let repository_id: RepositoryId = repository.id;
@@ -675,6 +776,7 @@ pub async fn handler(
                 async {
                     let pushed = push(
                         repository.clone(),
+                        local_tier.as_ref(),
                         branch,
                         revision,
                         access,
@@ -863,10 +965,10 @@ impl PushAccess {
         let access = Self {
             write: authorizer
                 .permits(extensions, repository, Action::Write)
-                .await,
+                .await?,
             push_protected: authorizer
                 .permits(extensions, repository, Action::PushProtected)
-                .await,
+                .await?,
         };
         if access.write || access.push_protected {
             Ok(access)
@@ -902,9 +1004,13 @@ struct VerifiedParents {
 
 /// Pushes `latest` as the latest revision of `branch`. A branch whose name doesn't map to it, as
 /// an archive leaves it, fails as not found.
+///
+/// `local_tier` is the store that reads through `repository`'s store fill with what they read,
+/// which the push prefetches the trees it walks into; `None` prefetches nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn push(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     branch: BranchId,
     latest: Hash,
     access: PushAccess,
@@ -917,6 +1023,7 @@ pub async fn push(
     let (metadata, loaded) = load_branch_and_head(repository.clone(), branch, latest).await;
     push_loaded(
         repository,
+        local_tier,
         branch,
         latest,
         access,
@@ -955,6 +1062,7 @@ pub(crate) async fn load_branch_and_head(
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub(crate) async fn push_loaded(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     branch: BranchId,
     latest: Hash,
     access: PushAccess,
@@ -982,6 +1090,7 @@ pub(crate) async fn push_loaded(
         async {
             prepare_push(
                 repository.clone(),
+                local_tier,
                 latest,
                 loaded?,
                 force,
@@ -1002,6 +1111,7 @@ pub(crate) async fn push_loaded(
         } => {
             store_new_head(
                 repository,
+                local_tier,
                 branch,
                 latest,
                 loaded,
@@ -1021,6 +1131,7 @@ pub(crate) async fn push_loaded(
         } => {
             try_fast_forward_merge(
                 repository,
+                local_tier,
                 branch,
                 loaded.incoming,
                 loaded.head,
@@ -1059,7 +1170,7 @@ async fn load_branch_metadata(
 /// Refuses a push the caller's `access` does not cover: a protected branch needs
 /// `push-protected`, any other branch `write`.
 fn check_push_access(metadata: &Metadata, access: PushAccess) -> Result<(), Status> {
-    if metadata.get_bool(PROTECT).unwrap_or_default() {
+    if branch::protected(metadata) {
         if !access.push_protected {
             warn!("Branch push failed, branch is protected");
             return Err(Status::permission_denied("protected"));
@@ -1199,6 +1310,7 @@ fn decide_head_move(
 /// when it moves at all.
 async fn prepare_push(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     latest: Hash,
     loaded: HeadAndIncoming,
     force: bool,
@@ -1221,10 +1333,12 @@ async fn prepare_push(
         return Ok(PreparedPush::Done(HeadUpdate::declined(loaded.head)));
     };
 
+    check_request_cancelled()?;
     // Both a plain push and a fast-forward merge verify the incoming revision against its own
     // parents, which do not depend on the head. Without this check a client could reference
     // fragments that were never fully uploaded.
-    let parents = verify_incoming_fragments(repository, loaded.incoming.clone(), report).await?;
+    let parents =
+        verify_incoming_fragments(repository, local_tier, loaded.incoming.clone(), report).await?;
 
     Ok(PreparedPush::Move {
         loaded,
@@ -1237,6 +1351,7 @@ async fn prepare_push(
 /// them exists.
 async fn verify_incoming_fragments(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     state: Arc<State>,
     report: &mut PushReport,
 ) -> Result<VerifiedParents, Status> {
@@ -1247,9 +1362,17 @@ async fn verify_incoming_fragments(
 
     let other = load_other_parent_state(repository.clone(), &state).await?;
 
-    let verified = verify_fragments(repository, parent.clone(), other.clone(), state, report).await;
+    let verified = verify_fragments(
+        repository,
+        local_tier,
+        parent.clone(),
+        other.clone(),
+        state,
+        report,
+    )
+    .await;
     report.verified_at = Some(Instant::now());
-    report.verification_failed = verified.is_err();
+    report.verification_failure = PushFailure::of(&verified);
     verified?;
 
     Ok(VerifiedParents { parent, other })
@@ -1260,6 +1383,7 @@ async fn verify_incoming_fragments(
 #[allow(clippy::too_many_arguments)]
 async fn store_new_head(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     branch: BranchId,
     latest: Hash,
     loaded: HeadAndIncoming,
@@ -1271,6 +1395,7 @@ async fn store_new_head(
     report: &mut PushReport,
 ) -> Result<HeadUpdate, Status> {
     report.enter(PushPhase::Commit);
+    check_request_cancelled()?;
     let HeadAndIncoming {
         head: mut current,
         incoming,
@@ -1294,6 +1419,10 @@ async fn store_new_head(
     }
 
     loop {
+        // Every pass starts with the latest revision unmoved by this push: the first, or a retry
+        // after the latest revision moved underneath it. Once a store lands, the loop returns
+        // without checking again.
+        check_request_cancelled()?;
         report.store_latest_attempts += 1;
         let previous_head = try_store_latest(repository.clone(), branch, current, new_head)
             .await
@@ -1332,6 +1461,7 @@ async fn store_new_head(
             Some(HeadMove::Merge) => {
                 return try_fast_forward_merge(
                     repository,
+                    local_tier,
                     branch,
                     incoming,
                     current,
@@ -1358,9 +1488,11 @@ async fn store_new_head(
 /// can resolve locally.
 ///
 /// Retries via CAS loop if the branch head moves again during processing.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 async fn try_fast_forward_merge(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     branch: BranchId,
     incoming_state: Arc<State>,
     mut current_head: Hash,
@@ -1378,27 +1510,44 @@ async fn try_fast_forward_merge(
 
     loop {
         report.enter(PushPhase::FastForwardMerge);
+        // As in the plain push, a pass reaches here only while the latest revision is unmoved by
+        // this push.
+        check_request_cancelled()?;
 
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
         debug!(
             %original_base, %incoming_revision, %current_head,
             "Computing diff3 for fast-forward merge"
         );
-        let diff_result = lore_revision::revision::diff3_collect(
-            repository.clone(),
-            original_base,
-            incoming_revision,
-            current_head,
-            None,
-            false,
-        )
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to compute diff3 for fast-forward merge: {err}"
-            ))
-        })?;
+        let diffed = {
+            let diff = pin!(lore_revision::revision::diff3_collect(
+                repository.clone(),
+                original_base,
+                incoming_revision,
+                current_head,
+                None,
+                true,
+            ));
+            let prefetch = pin!(local_tier.map(|local| {
+                prefetch_changed_node_blocks(
+                    repository.clone(),
+                    local.clone(),
+                    original_base,
+                    vec![incoming_revision, current_head],
+                    MAX_PREFETCH_BLOCKS,
+                    report.merge_prefetch.clone(),
+                )
+            }));
+            beside_prefetch(diff, prefetch.as_pin_mut()).await
+        };
+        let mut diff_result = diffed
+            .filter_slow_down()?
+            .filter_cancelled()?
+            .warn_map_err(|err| {
+                Status::internal(format!(
+                    "Failed to compute diff3 for fast-forward merge: {err}"
+                ))
+            })?;
         debug!(
             changes = diff_result.changes.len(),
             conflicts = diff_result.conflicts.len(),
@@ -1413,9 +1562,15 @@ async fn try_fast_forward_merge(
             report.fast_forward_merge_changes = None;
             return Ok(HeadUpdate::declined(current_head));
         }
-        // Recorded before the merge is applied, so a push cancelled while applying or storing it
+        // Recorded before the merge is applied, so a push that stops or fails short of storing it
         // still reports the size of the merge it was working on.
         report.fast_forward_merge_changes = Some(diff_result.changes.len() as u64);
+        #[cfg(feature = "test-util")]
+        crate::test_util::push_step(crate::test_util::PushStep::MergeDiffed).await;
+        // Applying the merge writes its tree, so a dropped push stops here rather than write a
+        // merge. A pass that loses the swap stops at the loop's next check, leaving the merge it
+        // wrote unreferenced, as a push stopped after uploading leaves its fragments.
+        check_request_cancelled()?;
 
         // Deserialize the current head state to use as base for the new merge revision
         let state_current = State::deserialize(repository.clone(), current_head)
@@ -1430,7 +1585,8 @@ async fn try_fast_forward_merge(
         lore_revision::commit::merge_tree_changes(
             repository.clone(),
             state_current.clone(),
-            &diff_result.changes,
+            &incoming_state,
+            &mut diff_result.changes,
         )
         .await
         .filter_slow_down()?
@@ -1440,11 +1596,6 @@ async fn try_fast_forward_merge(
             ))
         })?;
 
-        // Set parents: self=current head (target branch), other=incoming merge revision
-        state_current.set_parent_self(current_head);
-        state_current.set_parent_other(incoming_revision);
-
-        // Compute revision number from both parents
         let parent_state = State::deserialize(repository.clone(), current_head)
             .await
             .filter_slow_down()?
@@ -1452,11 +1603,7 @@ async fn try_fast_forward_merge(
                 Status::internal(format!("Failed to load current head state: {err}"))
             })?;
 
-        let revision_number = next_revision_number(
-            parent_state.revision_number(),
-            incoming_state.revision_number(),
-        );
-        state_current.set_revision_number(revision_number);
+        let revision_number = state_current.revision_number();
 
         // Copy metadata from the incoming revision and set merged-by to "server"
         let incoming_metadata_hash = incoming_state.metadata_hash();
@@ -1635,6 +1782,7 @@ async fn collect_new_addresses(
         )
             .instrument(span!(Level::DEBUG, "collect_new_addresses"))
             .await
+            .filter_cancelled()?
             .warn_map_err(|err| {
                 if let Some(converted_error) = err.as_address_not_found() {
                     return address_not_found_status(
@@ -1717,20 +1865,40 @@ async fn collect_new_addresses(
 /// `NOT_FOUND` is left to name an absent branch, which a caller restores with a create.
 async fn verify_fragments(
     repository: Arc<RepositoryContext>,
+    local_tier: Option<&Arc<dyn lore_storage::ImmutableStore>>,
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
     report: &mut PushReport,
 ) -> Result<(), Status> {
     report.collect_started = Some(Instant::now());
-    let mut new_fragments = collect_new_addresses(
-        repository.clone(),
-        parent_state,
-        other_parent_state,
-        state,
-        report.store_requests.clone(),
-    )
-    .await?;
+    let collected = {
+        let pushed = state.revision();
+        let parents = [Some(&parent_state), other_parent_state.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|parent| parent.revision())
+            .collect();
+        let collect = pin!(collect_new_addresses(
+            repository.clone(),
+            parent_state,
+            other_parent_state,
+            state,
+            report.store_requests.clone(),
+        ));
+        let prefetch = pin!(local_tier.map(|local| {
+            prefetch_changed_node_blocks(
+                repository.clone(),
+                local.clone(),
+                pushed,
+                parents,
+                MAX_PREFETCH_BLOCKS,
+                report.verify_prefetch.clone(),
+            )
+        }));
+        beside_prefetch(collect, prefetch.as_pin_mut()).await
+    };
+    let mut new_fragments = collected?;
     report.exist_started = Some(Instant::now());
     report.collected_addresses = Some(new_fragments.len() as u64);
 
@@ -1748,6 +1916,8 @@ async fn verify_fragments(
 
     let mut tasks = JoinSet::new();
     while !new_fragments.is_empty() || !tasks.is_empty() {
+        // Each wave is joined in full before the next, so no query is in flight here.
+        check_request_cancelled()?;
         let num_addresses = new_fragments.len();
         let batch_span = span!(
             Level::DEBUG,

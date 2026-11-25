@@ -22,6 +22,7 @@ use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -78,7 +79,7 @@ pub async fn handler(
         .scope(execution, async move {
             if !authorizer
                 .permits(&extensions, repository, Action::Obliterate)
-                .await
+                .await?
             {
                 warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
                 return Err(Status::permission_denied("Permission denied"));
@@ -103,6 +104,7 @@ pub async fn handler(
 
             info!("Handling obliterate request for address {address}");
 
+            check_request_cancelled()?;
             let stats = Arc::new(StoreObliterateStats::default());
             immutable_store
                 .obliterate(repository, address, stats.clone())

@@ -18,6 +18,7 @@ use lore_revision::state::Ext;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_revision::state::StateNodeChildrenWithNameIterator;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::state::collect_dirty_paths_inner;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
@@ -151,6 +152,7 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             for name in ["alpha", "xurc", "omega"] {
@@ -265,8 +267,8 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
                 .await
                 .expect("collecting dirty paths must not fail on the planted node");
             assert_eq!(
-                collected
-                    .iter()
+                (collected.paths.iter())
+                    .chain(&collected.directories)
                     .map(|path| path.as_str())
                     .collect::<Vec<_>>(),
                 vec!["alpha"]

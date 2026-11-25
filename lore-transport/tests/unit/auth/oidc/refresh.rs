@@ -5,6 +5,7 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use lore_base::test_util::closed_port_url;
 use lore_transport::Authentication;
 use lore_transport::auth::oidc;
 use lore_transport::auth::oidc::OidcAuthentication;
@@ -92,6 +93,7 @@ async fn the_refresh_token_is_traded_for_a_new_token_and_its_successor() {
         access_token(&provider.issuer, "alice", "Alice")
     );
     assert_eq!(authn.user_id, "alice");
+    assert_eq!(authn.lifetime_ms, Some(300_000));
     assert_eq!(authn.refresh_token.as_deref(), Some("refresh-2"));
     assert_eq!(authn.scope.as_deref(), Some("openid offline_access"));
 }
@@ -204,8 +206,7 @@ async fn an_endpoint_naming_another_issuer_is_refused() {
 /// `Disconnected` and the refresh token unspent.
 #[tokio::test]
 async fn a_grant_that_cannot_connect_is_disconnected() {
-    let closed = closed_port();
-    let token_endpoint_base = closed.url.clone();
+    let token_endpoint_base = closed_port_url("http");
     let provider =
         spawn_recording_provider(move |issuer, _, _| json(&document(issuer, &token_endpoint_base)))
             .await;

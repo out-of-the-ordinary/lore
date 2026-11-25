@@ -11,6 +11,7 @@ use crate::branch::BranchLatestStatus;
 use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
+use crate::branch::push::refusal_as_internal;
 use crate::change;
 use crate::commit;
 use crate::errors::*;
@@ -40,7 +41,9 @@ use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileBeginEventData {
     /// Number of files to process.
@@ -49,7 +52,9 @@ pub struct LoreRevisionRestoreFileBeginEventData {
 
 /// Event data reported for a single file during a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEventData {
     /// Path of the file.
@@ -71,7 +76,9 @@ pub struct LoreRevisionRestoreFileEventData {
 
 /// Event data reported at the end of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEndEventData {
     /// Number of files processed.
@@ -80,7 +87,7 @@ pub struct LoreRevisionRestoreFileEndEventData {
 
 /// Event data reported at the start of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentBeginEventData {
     /// Number of fragments to transfer.
@@ -89,7 +96,7 @@ pub struct LoreRevisionRestoreFragmentBeginEventData {
 
 /// Event data reported on progress of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentProgressEventData {
     /// Number of fragments completed.
@@ -100,7 +107,7 @@ pub struct LoreRevisionRestoreFragmentProgressEventData {
 
 /// Event data reported at the end of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentEndEventData {
     /// Number of fragments transferred.
@@ -109,7 +116,9 @@ pub struct LoreRevisionRestoreFragmentEndEventData {
 
 /// Event data reported with the resulting revision of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreRevisionEventData {
     /// Resulting revision hash signature.
@@ -120,7 +129,9 @@ pub struct LoreRevisionRestoreRevisionEventData {
 
 /// Event data reported at the start of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncBeginEventData {
     /// Number of changes to apply.
@@ -129,7 +140,9 @@ pub struct LoreRevisionRestoreSyncBeginEventData {
 
 /// Event data reported at the end of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncEndEventData {
     /// Number of changes applied.
@@ -138,6 +151,8 @@ pub struct LoreRevisionRestoreSyncEndEventData {
 
 #[error_set]
 pub enum RestoreError {
+    Cancelled,
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,
@@ -375,8 +390,8 @@ pub(crate) async fn restore(
         repository.clone(),
         Arc::new(changes.clone()),
         Some(state_staged.clone()),
-        true,  /* No changes on disk */
-        false, /* No merge */
+        true, /* No changes on disk */
+        None, /* No merge */
         stats,
     )
     .await
@@ -449,7 +464,7 @@ pub(crate) async fn restore(
     .await
     .forward::<RestoreError>("pruning dirty nodes before rehash")?;
 
-    let modified_times = commit::rehash_tree_in_operation(
+    let (modified_times, _) = commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
@@ -472,16 +487,18 @@ pub(crate) async fn restore(
             .forward::<RestoreError>("serializing metadata")?,
     );
 
-    commit::weave_history(
+    commit::weave_changes(
         repository.clone(),
         new_state.clone(),
         commit::BasedOn::FirstParent,
+        &[],
+        None,
     )
     .await
     .forward::<RestoreError>("weaving history")?;
 
     let signature = new_state
-        .serialize(repository.clone(), token)
+        .serialize_committed(repository.clone(), token)
         .await
         .forward::<RestoreError>("serializing new state")?;
 
@@ -561,6 +578,7 @@ pub(crate) async fn restore(
         let response = revision_protocol
             .branch_push(current_branch, signature, false, false)
             .await
+            .map_err(refusal_as_internal)
             .forward::<RestoreError>("pushing branch head pointer")?;
 
         if response.fast_forward_merged {

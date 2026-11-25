@@ -97,6 +97,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        can_read,
     ));
 
     LORE_CONTEXT
@@ -126,7 +127,6 @@ pub async fn handler(
                     signature,
                     path,
                     max_depth,
-                    can_read,
                     header,
                     tx,
                     include_last_revision,
@@ -144,13 +144,12 @@ pub async fn handler(
 /// unattributed is reported in one warning.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+#[allow(clippy::manual_async_fn)]
 fn stream_tree(
     repository: Arc<RepositoryContext>,
     signature: Hash,
     path: RelativePath,
     max_depth: usize,
-    can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
     include_last_revision: bool,
@@ -169,28 +168,13 @@ fn stream_tree(
             signature,
             path,
             max_depth,
-            can_read,
             include_last_revision,
         )
         .await
         {
             Ok(walk) => walk,
             Err(err) => {
-                let status = if err.is_slow_down() {
-                    Status::resource_exhausted(err.to_string())
-                } else if err.is_invalid_path() {
-                    Status::invalid_argument(
-                        "Cannot calculate tree for path that is not a directory",
-                    )
-                } else if err.is_node_not_found() {
-                    Status::not_found("A node in the tree could not be found")
-                } else {
-                    warn!(
-                        {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
-                        "Failed to walk revision tree",
-                    );
-                    warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-                };
+                let status = tree_error_status(&repository, signature, &err);
                 if let Ok(permit) = tx.reserve().await {
                     permit.send(Err(status));
                 }
@@ -469,4 +453,22 @@ async fn emit_tree_stream<'a, F>(
     }
 
     debug!(emitted_nodes, emitted_revisions, "RevisionTree complete");
+}
+
+fn tree_error_status(repository: &RepositoryContext, signature: Hash, err: &StateError) -> Status {
+    if err.is_cancelled() {
+        Status::cancelled(err.to_string())
+    } else if err.is_slow_down() {
+        Status::resource_exhausted(err.to_string())
+    } else if err.is_invalid_path() {
+        Status::invalid_argument("Cannot calculate tree for path that is not a directory")
+    } else if err.is_node_not_found() {
+        Status::not_found("A node in the tree could not be found")
+    } else {
+        warn!(
+            {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
+            "Failed to walk revision tree",
+        );
+        warn_error_to_status(err, |e| Status::internal(e.to_string()))
+    }
 }

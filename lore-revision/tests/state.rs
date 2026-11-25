@@ -312,6 +312,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_tree_walk_returns_no_tree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    rand::random::<RepositoryId>(),
+                    lore_revision::state::allow_all_repositories(),
+                ));
+                let state = State::new();
+                for name in ["a", "b", "c"] {
+                    let node = Node {
+                        flags: NodeFlags::File.bits(),
+                        name_hash: hash_string(name),
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(repository.clone(), ROOT_NODE, node, name)
+                        .await
+                        .expect("Failed to add node");
+                }
+
+                let cancellation = lore_revision::runtime::Cancellation::new();
+                cancellation.cancel();
+                let cancelled = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                    )
+                    .with_cancellation(cancellation),
+                );
+                let Err(err) = LORE_CONTEXT
+                    .scope(
+                        cancelled,
+                        lore_revision::state::gather_tree_paths(
+                            state,
+                            repository,
+                            lore_revision::util::path::RelativePath::new(),
+                            0,
+                            false,
+                        ),
+                    )
+                    .await
+                else {
+                    panic!("a cancelled walk returns no tree");
+                };
+                assert!(err.is_cancelled(), "{err:?}");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fragment_collection_returns_no_list() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store.clone(), mutable_store)
+                            .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state_from = State::new();
+                let state_to = State::new();
+                let name = "test-node";
+                let node = Node {
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                state_to
+                    .node_add(repository.clone(), ROOT_NODE, node, name)
+                    .await
+                    .expect("Failed to add node");
+                state_from
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+                let signature_to = state_to
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let cancellation = lore_revision::runtime::Cancellation::new();
+                cancellation.cancel();
+                let cancelled = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                    )
+                    .with_cancellation(cancellation),
+                );
+                let err = LORE_CONTEXT
+                    .scope(
+                        cancelled,
+                        collect_new_fragments(
+                            repository.clone(),
+                            state_from,
+                            state_to,
+                            true,
+                            Arc::new(StoreRequestTracker::default()),
+                        ),
+                    )
+                    .await
+                    .expect_err("a cancelled collection returns no list");
+                assert!(err.is_cancelled(), "{err:?}");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -984,7 +1118,8 @@ mod tests {
 
     /// Run `body` against a fresh in-memory state, inside the execution scope the
     /// state edits read their globals from. Nothing here serializes, so the
-    /// repository needs no path and no write token.
+    /// repository needs no write token; its path is a scratch directory, as a
+    /// provider over it reads its Lore directory.
     async fn with_state<F, Fut>(body: F)
     where
         F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut + Send + 'static,
@@ -1002,8 +1137,10 @@ mod tests {
                 )
                 .await
                 .expect("Failed to create store");
+                let tempdir = generate_tempdir();
                 let repository = Arc::new(RepositoryContext::new(
-                    default_repository_creation_args(immutable_store, mutable_store),
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(tempdir.path()),
                 ));
                 body(repository, State::new()).await;
             }))
@@ -1582,7 +1719,7 @@ mod tests {
                 lore_revision::state::node_discard_free(
                     &state,
                     &repository,
-                    &[node],
+                    &[(node, 0)],
                     Vec::new(),
                     |_, _| {},
                 )
@@ -3541,6 +3678,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 
@@ -3572,6 +3710,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let options = immutable::read_options_from_repository(&repository);
@@ -3619,6 +3758,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let mut tree_walk = lore_revision::state::TreeWalk::default();
@@ -3631,7 +3771,6 @@ mod block_single_flight {
                     0,
                     0,
                     0,
-                    lore_revision::state::allow_all_repositories(),
                     &mut tree_walk,
                     true,
                 );
@@ -3648,7 +3787,7 @@ mod block_single_flight {
     }
 
     /// A node block read holds its read of the current format, and the fallback to the older
-    /// formats, which holds a read as large and the conversion, stays in a box of its own.
+    /// formats, which holds a read as large and the first read's error, stays in a box of its own.
     #[tokio::test]
     async fn a_node_block_read_keeps_the_older_formats_out_of_its_future() {
         LORE_CONTEXT
@@ -3658,12 +3797,16 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 
                 let read = NodeBlock::deserialize(repository.clone(), &state, Address::default());
-                let fallback =
-                    NodeBlock::deserialize_other_version(repository, &state, Address::default());
+                let fallback = lore_revision::node::read_older_node_block(
+                    repository,
+                    Address::default(),
+                    lore_revision::immutable::ImmutableError::internal("the current format's read"),
+                );
 
                 assert!(
                     size_of_val(&read) < size_of_val(&fallback),

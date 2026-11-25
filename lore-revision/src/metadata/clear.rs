@@ -18,7 +18,7 @@ use crate::state;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearRevisionEventData {
     /// Hash of the revision whose metadata was cleared.
@@ -27,7 +27,7 @@ pub struct LoreMetadataClearRevisionEventData {
 
 /// Data for an event reporting that a file's metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearFileEventData {
     /// Path of the file whose metadata was cleared.
@@ -47,9 +47,10 @@ pub(crate) async fn clear_revision(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<MetadataErrors>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<MetadataErrors>("deserializing state")?;
 
     state.set_metadata_hash(Hash::default());
 
@@ -97,9 +98,10 @@ pub async fn clear_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<MetadataErrors>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<MetadataErrors>("deserializing state")?;
 
     let node = super::file_node_outside_links(&state, &repository, &path).await?;
 

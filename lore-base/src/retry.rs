@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Exponential back-off with jitter, shared by every crate that retries a remote operation.
+//! Exponential back-off with jitter, shared by every crate that retries an operation.
 
 use std::time::Duration;
 
@@ -43,6 +43,12 @@ impl Retry {
         self.current = std::cmp::min(self.current * 2, self.maximum);
         self.counter += 1;
         Some(Duration::from_millis(interval))
+    }
+
+    /// Restore all `limit` waits, keeping the current interval so the back-off goes on growing
+    /// from where it is.
+    pub fn reset_attempts(&mut self) {
+        self.counter = 0;
     }
 
     pub fn counter(&self) -> usize {

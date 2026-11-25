@@ -9,6 +9,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
@@ -24,6 +25,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::delete_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -118,6 +120,7 @@ pub async fn branch_delete_implementation(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
@@ -149,6 +152,7 @@ pub async fn branch_delete_implementation(
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 
+            check_request_cancelled()?;
             match delete_branch_detached(
                 repository.clone(),
                 branch_id,

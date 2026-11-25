@@ -27,7 +27,6 @@ mod global;
 #[path = "../helper.rs"]
 mod helper;
 mod history;
-mod hooked_store;
 mod immutable;
 mod infer;
 mod instance;
@@ -43,16 +42,22 @@ mod metadata;
 mod node;
 mod notification;
 mod paged_remote;
+mod progress;
 mod protocol;
 mod records;
 mod refusal;
 mod relay;
 mod repository;
 mod revision;
+mod runtime;
+mod service_state;
 mod stage;
 mod state;
 mod store;
 mod util;
+/// The seeded xorshift these tests share with the FUSE tests' own binaries.
+#[path = "../support/xorshift.rs"]
+mod xorshift;
 
 /// Points the unit tests at a global data and config directory of their own, rather than the
 /// machine's, so a test's external `.lore` lookups and shared store registry stay inside it

@@ -22,9 +22,9 @@
 //! repeat; and each read by a listing's `ChainMark` held to the marked listing it names, from the
 //! listing's head read: a node a search found carrying the name, a miss over the nodes that joined
 //! since, and, under the gate, over a count moved past the mark's while its head stood, a stale
-//! search and a reattach found by the count, a reattach not found, under the gate, by it as the
-//! read began, a read by the mark of the call's own marked listing so within its own interval, by
-//! the prepends the call counted by then; each name read held to its one name record, a comparison
+//! search, a reattach and a change found by the count, a reattach not found and a chain found
+//! unchanged, under the gate, by it as the read began, a read by the mark of the call's own marked
+//! listing so within its own interval, by the prepends the call counted by then; each name read held to its one name record, a comparison
 //! by it, and a path read to its walk up its parents and the names it read; and each has-children
 //! read held to its directory from its listing's head read: a child found carrying the flags a
 //! node of the directory at some `seq` since, carrying them then or later, none found a violation
@@ -70,6 +70,8 @@ use super::fields::Fields;
 use crate::harness::catalogue;
 use crate::harness::catalogue::call::Answer;
 use crate::harness::catalogue::call::Call;
+use crate::harness::catalogue::call::Failed;
+use crate::harness::catalogue::call::FailedRead;
 use crate::harness::catalogue::call::Leaves;
 use crate::harness::catalogue::call::Lookup;
 use crate::harness::catalogue::call::Outcome;
@@ -84,7 +86,6 @@ use crate::harness::catalogue::call::path_spelling;
 use crate::harness::catalogue::call::spelling;
 use crate::harness::catalogue::call::spelling_below;
 use crate::harness::catalogue::ops::Flagged;
-use crate::harness::faults::INJECTED_AS;
 
 /// What a call's records tell of its answer, as the replay goes.
 #[derive(Clone, Debug, Default)]
@@ -134,10 +135,9 @@ pub(super) struct Answered {
     hopped: usize,
     crossed_at: Option<u64>,
     /// Each child a dirty-paths collection named, in order, and whether its root, as the model held
-    /// it at its head read, was a dirty add with no child but `Discarded` ones, which its walk
-    /// passes.
+    /// it at its head read, stood for itself ([`stands_alone`]).
     namings: Vec<Naming>,
-    root_empty_add: bool,
+    root_stands: bool,
     /// Whether the listing it names, for a read by a listing's mark, was a marked listing of its
     /// directory on its State whose head read the replay had met as it began, its mark judging
     /// its claims ([`ByMark`]).
@@ -221,6 +221,33 @@ fn collects(call: &Call) -> bool {
     std::ptr::eq(call.kind, &catalogue::DIRTY_PATHS)
 }
 
+/// Whether a failed read in `call` gives `failed`: any read, for most such errors, and a read of a
+/// revision's State only in a call loading one through a link ([`loads_linked`]).
+fn read_gives(call: &Call, failed: &Failed) -> bool {
+    match failed.read {
+        Some(FailedRead::Any) => true,
+        Some(FailedRead::RevisionState) => loads_linked(call),
+        None => false,
+    }
+}
+
+/// Whether `call` may load the revision a link pins: a listing or a collection of children
+/// following links, a resolution entering them, or a collection of dirty paths, which follows a
+/// dirty link.
+fn loads_linked(call: &Call) -> bool {
+    [
+        &catalogue::LISTED_CHILDREN,
+        &catalogue::LISTED_NAME_HASHES,
+        &catalogue::LISTED_MARKED,
+        &catalogue::COLLECTED_CHILDREN,
+        &catalogue::COLLECTED_VERSIONED_CHILDREN,
+        &catalogue::FIND_LINKED,
+        &catalogue::DIRTY_PATHS,
+    ]
+    .into_iter()
+    .any(|kind| std::ptr::eq(call.kind, kind))
+}
+
 /// Whether `call` resolves a path entering links on the way ([`Call::names`]).
 fn resolves(call: &Call) -> bool {
     std::ptr::eq(call.kind, &catalogue::FIND_LINKED)
@@ -291,6 +318,7 @@ pub(super) fn hops_looked_up(calls: &mut [Call], records: &[Record], spawns: &[S
 fn reads_by_mark(call: &Call) -> bool {
     std::ptr::eq(call.kind, &catalogue::ADDED_SINCE)
         || std::ptr::eq(call.kind, &catalogue::REATTACHED_SINCE)
+        || std::ptr::eq(call.kind, &catalogue::UNCHANGED_SINCE)
 }
 
 /// Whether `call` lists with a mark, its head read keeping the chain's head as its `ChainMark`
@@ -304,9 +332,9 @@ fn lists_marked(call: &Call) -> bool {
 /// prepends to it the call counted in the mark by then; none for a find.
 fn own_mark_of(lookup: &Lookup) -> Option<(NodeID, u32)> {
     match *lookup {
-        Lookup::Since { dir, prepends, .. } | Lookup::Reattached { dir, prepends, .. } => {
-            Some((dir, prepends))
-        }
+        Lookup::Since { dir, prepends, .. }
+        | Lookup::Reattached { dir, prepends, .. }
+        | Lookup::Unchanged { dir, prepends, .. } => Some((dir, prepends)),
         Lookup::Find { .. } => None,
     }
 }
@@ -342,18 +370,23 @@ fn keeps_own_head(lookup: &Lookup) -> bool {
     )
 }
 
-/// Whether `past` is judged under the gate alone: a search's mark's head kept and a mark found not
-/// reattached, each by a count read with no lock, which is the model's as the read began only
-/// there.
+/// Whether `past` is judged under the gate alone: a search's mark's head kept, a mark found not
+/// reattached and a mark found unchanged, each by a count read with no lock, which is the model's
+/// as the read began only there.
 fn gated_only(past: Past) -> bool {
     matches!(
         past,
         Past::Kept
             | Past::OwnKept(_)
-            | Past::Lookup(Lookup::Reattached {
-                reattached: false,
-                ..
-            })
+            | Past::Lookup(
+                Lookup::Reattached {
+                    reattached: false,
+                    ..
+                } | Lookup::Unchanged {
+                    unchanged: true,
+                    ..
+                }
+            )
     )
 }
 
@@ -445,6 +478,13 @@ pub(super) enum Claim {
     /// The directory's count not moved by a reattach past `base`; as a count only grows, read so
     /// where it is read from or at no read.
     Unmoved { dir: NodeID, base: u32 },
+    /// The directory's count at `base`, its listing's mark's count with the prepends its holder
+    /// counted: no other change linked a child into the chain since the mark (C5). As a count only
+    /// grows, read so where it is read from or at no read. No sweep runs beside a reads' call,
+    /// sweeps running between bursts, so the mark's reclaim count stands throughout.
+    Unchanged { dir: NodeID, base: u32 },
+    /// The directory's count moved past `base`, or its slot freed.
+    Changed { dir: NodeID, base: u32 },
     /// A node of the directory at some read so far carrying the flags `flagged` names at a read
     /// since, both from the listing's head read: the nodes a has-children read's listing may have
     /// held, kept in the claim's reach, as it reads each child's words after its listing. By id, so
@@ -760,6 +800,9 @@ impl Claim {
             Lookup::Reattached {
                 dir, reattached, ..
             } => Self::answered_by_mark((dir, None), Answer::Reattached(reattached), mark),
+            Lookup::Unchanged { dir, unchanged, .. } => {
+                Self::answered_by_mark((dir, None), Answer::Unchanged(unchanged), mark)
+            }
             Lookup::Find { .. } => None,
         }
     }
@@ -794,6 +837,8 @@ impl Claim {
                 or_gone: false,
             },
             Answer::Reattached(false) => Self::Unmoved { dir, base },
+            Answer::Unchanged(true) => Self::Unchanged { dir, base },
+            Answer::Unchanged(false) => Self::Changed { dir, base },
             _ => return None,
         })
     }
@@ -819,7 +864,9 @@ impl Claim {
                 found: None,
                 ..
             } => Self::Missed { dir, name },
-            Lookup::Since { .. } | Lookup::Reattached { .. } => Self::OwnRead(lookup),
+            Lookup::Since { .. } | Lookup::Reattached { .. } | Lookup::Unchanged { .. } => {
+                Self::OwnRead(lookup)
+            }
         }
     }
 
@@ -995,6 +1042,10 @@ impl Claim {
                 moved_past(slot, base) || (or_gone && !slot.record.is_directory())
             }),
             Self::Unmoved { dir, base } => !moved(state, dir, base),
+            Self::Unchanged { dir, base } => {
+                state.slot(dir).is_some_and(|slot| slot.changes == base)
+            }
+            Self::Changed { dir, base } => state.slot(dir).is_none_or(|slot| slot.changes != base),
             Self::Kept { dir, head, base } => {
                 let chained = |head| {
                     (state.slot(head)).is_some_and(|slot| {
@@ -1257,9 +1308,8 @@ impl Replay<'_> {
                     || (call.target == Some(*node) && Flagged::of(call.kind).is_some())
                     || collects(call) =>
             {
-                // Whether a collection's root is a dirty add its walk finds empty, at its head read.
                 if collects(call) && answered.heads.is_empty() {
-                    answered.root_empty_add = empty_add(self.state, *node);
+                    answered.root_stands = stands_alone(self.state, *node);
                 }
                 // The chain's head only a marked listing's mark keeps.
                 let head = lists_marked(call)
@@ -1670,6 +1720,23 @@ fn judged(
                          began"
                     }
                 ),
+                Past::Lookup(Lookup::Unchanged {
+                    dir,
+                    unchanged,
+                    from,
+                    to,
+                    ..
+                }) => format!(
+                    "a read of its own listing's mark of {dir} in a call of '{name}' answered {}, \
+                     [{from}, {to})",
+                    if unchanged {
+                        "unchanged, its count moved past the mark's with the call's own prepends \
+                         as it began"
+                    } else {
+                        "changed, its count standing at the mark's with the call's own prepends \
+                         throughout its interval"
+                    }
+                ),
                 Past::Walk(walk, check) => {
                     let dir = call.walks[walk].dir;
                     match check {
@@ -1851,21 +1918,19 @@ fn live_in(slot: &Slot, dir: NodeID) -> bool {
     slot.status == Status::Chained && !slot.is_discarded() && slot.record.parent == dir
 }
 
-/// Whether a collection reports `record`: a dirty file, a dirty delete, or a dirty add
-/// [`reported_add`] keeps.
+/// Whether a collection reports `record`: a dirty file, a dirty delete, or a directory
+/// [`reported_marked`] keeps.
 fn reportable(record: &Node) -> bool {
     (record.is_file() && record.is_dirty())
-        || reported_add(record)
+        || reported_marked(record)
         || (record.is_directory() && record.is_dirty_delete())
 }
 
-/// Whether a collection reports `record`, a directory, as a dirty add: one staged, or heading no
-/// chain, as `marked_directory_carried_by_children` (state.rs) leaves the children of one only
-/// marked to carry it.
-fn reported_add(record: &Node) -> bool {
+/// Whether a collection reports `record`, a directory, at its own path, whatever it holds: a dirty
+/// add, and a dirty move not staged, as `stages_as_itself` (state.rs) takes one.
+fn reported_marked(record: &Node) -> bool {
     record.is_directory()
-        && record.is_dirty_add()
-        && (record.is_staged() || record.child().is_none())
+        && (record.is_dirty_add() || record.is_dirty_move() && !record.is_staged())
 }
 
 /// Whether a collection descends into `record`: a directory, dirty and no dirty delete.
@@ -1902,9 +1967,9 @@ fn collected_path(state: &StateModel, (root, listed): (NodeID, u64), node: NodeI
 
 /// Whether `node` stands for `call`, a collection, from `scope`, its root and its root's head read,
 /// at a path it did not report: a node it reports ([`reportable`]) at its [`collected_path`], or its
-/// root, but the State's, an [`empty_add`], at the empty path; or a dirty link there, which it
-/// follows, with a path the revision its pin names holds below it ([`linked_paths`]) unreported,
-/// or a pin the model does not follow.
+/// root, but the State's, where it [`stands_alone`], at the empty path; or a dirty link there,
+/// which it follows, with a path the revision its pin names holds below it ([`linked_paths`])
+/// unreported, or a pin the model does not follow.
 fn left_out(
     (state, revisions): (&StateModel, &BTreeMap<Hash, Snapshot>),
     call: &Call,
@@ -1914,7 +1979,7 @@ fn left_out(
     let unreported = |path: u64| call.paths.binary_search(&path).is_err();
     let (root, _) = scope;
     if node == root {
-        return root != ROOT_NODE && empty_add(state, root) && unreported(spelling(b""));
+        return root != ROOT_NODE && stands_alone(state, root) && unreported(spelling(b""));
     }
     let Some(record) = state.slot(node).map(|slot| &slot.record) else {
         return false;
@@ -1932,12 +1997,12 @@ fn left_out(
 
 /// The spellings of the paths a collection of `snapshot`, a dirty link's pinned revision, reports
 /// from `node`, the node the pin exposes, below the link's path `below`, sorted, as the product
-/// walks a linked State: none for a file; the link's own path for a dirty-add directory with no
-/// child but `Discarded` ones; else each dirty child not `Discarded`, a file, a dirty add
-/// [`reported_add`] keeps and a dirty delete reported, a dirty directory but a delete descended
-/// into. `None` where the pinned
-/// node is a link or the walk meets a dirty one, the product following either into a third State,
-/// or a node, a name or a chain the snapshot does not hold: not modelled, as no fixture holds one.
+/// walks a linked State: none for a file; the link's own path for a pinned directory that stands
+/// for itself, as [`stands_alone`] says of a root; each dirty child not `Discarded`, a file, a
+/// directory [`reported_marked`] keeps and a dirty delete reported, a dirty directory but a delete
+/// descended into. `None` where the pinned node is a link or the walk meets a dirty one, the
+/// product following either into a third State, or a node, a name or a chain the snapshot does not
+/// hold: not modelled, as no fixture holds one.
 fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64>> {
     let (pinned, _) = snapshot.slot(node)?;
     let mut paths = Vec::new();
@@ -1959,7 +2024,7 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
             } else if record.is_link() {
                 return None;
             } else {
-                if reported_add(record) {
+                if reported_marked(record) {
                     paths.push(spelled);
                 }
                 if record.is_dirty_delete() {
@@ -1969,7 +2034,7 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
                 }
             }
         }
-        if dir == node && empty && pinned.is_directory() && pinned.is_dirty_add() {
+        if dir == node && stands(pinned, empty) {
             paths.push(below);
         }
     }
@@ -1977,11 +2042,27 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
     Some(paths)
 }
 
-/// Whether `dir` is a dirty-add directory with no child but `Discarded` ones, which a walk passes:
-/// a collection's empty root, reported at its own path unless the State's root.
-fn empty_add(state: &StateModel, dir: NodeID) -> bool {
-    (state.slot(dir)).is_some_and(|slot| slot.record.is_directory() && slot.record.is_dirty_add())
-        && state.children(dir).all(|(_, word)| word.is_discarded())
+/// Whether `dir` stands for itself as a collection's root, reported at its own path unless the
+/// State's root: [`stands`] of its record, empty where it holds no child but `Discarded` ones,
+/// which a walk passes.
+fn stands_alone(state: &StateModel, dir: NodeID) -> bool {
+    (state.slot(dir)).is_some_and(|slot| {
+        stands(
+            &slot.record,
+            state.children(dir).all(|(_, word)| word.is_discarded()),
+        )
+    })
+}
+
+/// Whether `record`, a collection's root, stands for itself: a directory marked added or moved,
+/// not staged, whatever it holds, or a staged add holding nothing (`empty`).
+fn stands(record: &Node, empty: bool) -> bool {
+    record.is_directory()
+        && if record.is_staged() {
+            record.is_dirty_add() && empty
+        } else {
+            record.is_dirty_add() || record.is_dirty_move()
+        }
 }
 
 /// Each node below `dir` that [`left_out`] finds, into `reach`, descending as a collection does:
@@ -2115,12 +2196,13 @@ fn name_is_judged(call: &Call, answered: &Answered, is: bool) -> Option<String> 
 
 /// What is wrong with a collection's paths, by its call's own records, which rebuild its walk
 /// ([`walked`]). Each named file reported, each named directory it did not descend into reported,
-/// as a dirty delete, and no path more times than the nodes it named spell it, its empty root's
-/// once where it named none, which the State's root never is. Under the gate, where nothing lands
-/// between a child's words and its name: each named child dirty and in its directory as it read
-/// the name, each named directory descended into but a dirty delete and reported as a dirty add or
-/// a dirty delete, and its empty root reported as a dirty add; the gate alone catches a plain dirty
-/// directory reported, a clean child named, or a dirty delete descended into. Told apart by
+/// as a dirty delete, and no path more times than the nodes it named spell it, its root's once,
+/// which the State's root never is. Under the gate, where nothing lands between a child's words
+/// and its name: each named child dirty and in its directory as it read the name, each named
+/// directory descended into but a dirty delete and reported as a dirty add, a dirty move not
+/// staged or a dirty delete and no other, and its root reported where it stands for itself
+/// ([`stands_alone`]); the gate alone catches a plain dirty directory reported, a clean child
+/// named, or a dirty delete descended into. Told apart by
 /// nothing, as no fixture makes them: a slot freed and grabbed again within the collection, a
 /// directory pushed and then freed or made a file before its pop, which reads no head, a link
 /// freed between its words and its name, and in a run of no gate a directory named twice whose
@@ -2233,7 +2315,7 @@ fn collected_judged(
         linked.extend(paths);
     }
     linked.sort_unstable();
-    let (empty, root_empty) = (spelling(b""), namings.is_empty() && root != ROOT_NODE);
+    let (empty, own_root) = (spelling(b""), root != ROOT_NODE);
     for same in call.paths.chunk_by(|one, other| one == other) {
         let path = same[0];
         let below = linked.partition_point(|&linked| linked <= path)
@@ -2243,7 +2325,7 @@ fn collected_judged(
                 spells == path && naming.held.is_none_or(|held| !held.is_link())
             })
             .count()
-            + usize::from(root_empty && path == empty)
+            + usize::from(own_root && path == empty)
             + below;
         if same.len() > spells && !(unjudged && spells == 0) {
             return Some(if spells == 0 {
@@ -2278,34 +2360,32 @@ fn collected_judged(
         if !held.is_directory() {
             continue;
         }
-        let (deleted, added) = (held.is_dirty_delete(), reported_add(&held));
+        let (deleted, marked) = (held.is_dirty_delete(), reported_marked(&held));
         // A dirty delete pushes nothing, so no head is bound to one under the gate.
         let fault = match (descended, reported(path)) {
             (false, _) if !deleted => {
                 format!("did not descend into {node}, which the model held no dirty delete")
             }
-            (_, true) if held.is_dirty_add() && !added => {
-                format!("reported {node}, a dirty-add directory its children carry")
-            }
-            (_, true) if !added && !deleted => format!(
-                "reported {node}, a directory the model held neither a dirty add nor a dirty \
-                 delete"
+            (_, true) if !marked && !deleted => format!(
+                "reported {node}, a directory the model held neither a dirty add, a dirty move \
+                 nor a dirty delete"
             ),
-            (_, false) if added || deleted => format!(
-                "did not report {node}, a directory the model held a dirty add or a dirty delete"
+            (_, false) if marked || deleted => format!(
+                "did not report {node}, a directory the model held a dirty add, a dirty move or a \
+                 dirty delete"
             ),
             _ => continue,
         };
         return Some(format!("a call of '{name}' {fault}"));
     }
-    match (root_empty, reported(empty), answered.root_empty_add) {
+    match (own_root, reported(empty), answered.root_stands) {
         (true, true, false) => Some(format!(
-            "a call of '{name}' reported its empty root {root}, which the model held no dirty add \
-             with no children"
+            "a call of '{name}' reported its root {root}, which the model held standing for \
+             nothing"
         )),
         (true, false, true) => Some(format!(
-            "a call of '{name}' did not report its empty root {root}, which the model held a \
-             dirty add with no children"
+            "a call of '{name}' did not report its root {root}, which the model held standing \
+             for itself"
         )),
         _ => None,
     }
@@ -2494,12 +2574,14 @@ fn answer_judged(
                 "a call of '{name}' answered {answer:?}, not what its last lookup found"
             ))
         }
-        Outcome::Failed(error) if call.failed_reads == 0 => Some(format!(
-            "a call of '{name}' failed with no read failing in its interval: {error}"
+        Outcome::Failed(failed) if call.failed_reads == 0 => Some(format!(
+            "a call of '{name}' failed with no read failing in its interval: {}",
+            failed.text
         )),
-        Outcome::Failed(error) if !INJECTED_AS.iter().any(|text| error.contains(text)) => Some(
-            format!("a call of '{name}' failed with an error no failed read gives: {error}"),
-        ),
+        Outcome::Failed(failed) if !read_gives(call, failed) => Some(format!(
+            "a call of '{name}' failed with an error no failed read gives: {}",
+            failed.text
+        )),
         Outcome::Dropped if !call.kind.cancellable && !admits.uncancellable_drops => Some(format!(
             "a call of '{name}' was dropped part way, which its production caller never drops"
         )),
@@ -2603,8 +2685,9 @@ fn answer_judged(
                 )
             }),
         }),
-        // A read by a listing's mark, whose claim held at no `seq`; a mark found not reattached
-        // judged only under the gate, where the count it read lock-free is the model's as it began.
+        // A read by a listing's mark, whose claim held at no `seq`; a mark found not reattached or
+        // found unchanged judged only under the gate, where the count it read lock-free is the
+        // model's as it began.
         Outcome::Answer(Answer::Since(Some(node))) if answered.seen & 1 == 0 => Some(format!(
             "a search of {} since its listing's mark in a call of '{name}' answered {node}, \
              carrying the name at no seq of its interval",
@@ -2629,6 +2712,18 @@ fn answer_judged(
             Some(format!(
                 "a mark of {} in a call of '{name}' answered not reattached, its count moved by a \
                  reattach past the mark's as it began",
+                targeted(call)
+            ))
+        }
+        Outcome::Answer(Answer::Unchanged(false)) if answered.seen & 1 == 0 => Some(format!(
+            "a mark of {} in a call of '{name}' answered changed, its count standing at the \
+             mark's with its holder's own prepends",
+            targeted(call)
+        )),
+        Outcome::Answer(Answer::Unchanged(true)) if answered.seen & 1 == 0 && admits.gated => {
+            Some(format!(
+                "a mark of {} in a call of '{name}' answered unchanged, its count moved past the \
+                 mark's with its holder's own prepends as it began",
                 targeted(call)
             ))
         }

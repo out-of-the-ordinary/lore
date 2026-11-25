@@ -19,8 +19,10 @@ use crate::immutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::node::NodeFileMode;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
@@ -32,7 +34,7 @@ use crate::util::path::repository_relative_path;
 
 /// Data for the event emitted when file content is written to a destination.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileWriteEventData {
     /// Path that was written.
@@ -41,6 +43,8 @@ pub struct LoreFileWriteEventData {
 
 #[error_set]
 pub enum WriteError {
+    Cancelled,
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidAddress,
@@ -199,8 +203,8 @@ pub(crate) async fn write_file(
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
         .forward::<WriteError>("resolving user path")?;
 
-    let signature = if let Some(revision) = options.revision {
-        revision::resolve(
+    let (signature, current_revision) = if let Some(revision) = options.revision {
+        let resolved = revision::resolve(
             repository.clone(),
             revision.as_str(),
             execution_context().globals().search_location(),
@@ -212,43 +216,39 @@ pub(crate) async fn write_file(
                     revision: revision.clone(),
                 })
             })
-        })?
+        })?;
+        (resolved, Hash::default())
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
             .await
             .forward::<WriteError>("Failed to deserialize current revision anchor")?;
-        crate::instance::load_staged_revision(&repository)
+        let staged_revision = crate::instance::load_staged_revision(&repository)
             .await
             .ok()
             .flatten()
-            .unwrap_or(current_revision)
+            .unwrap_or(current_revision);
+        (staged_revision, current_revision)
     };
 
     let (destination, tracked) = write_destination(repository.require_path()?, output.as_str())?;
 
-    let state = state::State::deserialize(repository.clone(), signature)
+    let state = state::State::deserialize_staged(repository.clone(), signature, current_revision)
         .await
         .forward::<WriteError>("Failed to deserialize state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let Some((node_id, (link_repository, link_state))) = state
+        .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
         .await
-        .map_err(|err| {
-            forward_refusal_or(err, "finding the node", |_err| {
-                WriteError::from(FileNotFound {
-                    resource: relative_path.to_string(),
-                })
-            })
-        })?;
-    if !node_link.is_valid() {
+        .forward_any::<WriteError>("finding the node")?
+    else {
         return Err(FileNotFound {
             resource: relative_path.to_string(),
         }
         .into());
-    }
+    };
 
-    let node = state
-        .node(repository.clone(), node_link.node)
+    let node = link_state
+        .node(link_repository.clone(), node_id)
         .await
         .map_err(|err| {
             forward_refusal_or(err, "reading the node", |_err| {
@@ -274,7 +274,7 @@ pub(crate) async fn write_file(
                     .forward_any::<WriteError>("Failed to check the output destination")?,
                 &destination,
             )?;
-            set_file_to_node::<WriteError>(&operation, repository.clone(), &node, tracked)
+            set_file_to_node::<WriteError>(&operation, link_repository.clone(), &node, tracked)
                 .await
                 .map(|_written| ())
         })
@@ -285,7 +285,7 @@ pub(crate) async fn write_file(
         // operation, which writes nothing in a dry run.
         if !execution_context().globals().dry_run() {
             let written_metadata = immutable::read_into_file(
-                repository.clone(),
+                link_repository.clone(),
                 node.address,
                 destination.as_path(),
                 None,

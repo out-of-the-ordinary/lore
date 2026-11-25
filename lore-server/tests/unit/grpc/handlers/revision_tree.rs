@@ -17,6 +17,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
@@ -48,6 +49,7 @@ async fn tree_on_file_returns_invalid_argument() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -87,6 +89,7 @@ async fn tree_on_file_returns_invalid_argument() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -138,6 +141,7 @@ async fn tree_on_missing_path_returns_not_found() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -167,6 +171,7 @@ async fn tree_on_missing_path_returns_not_found() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -221,6 +226,7 @@ async fn tree_emits_link_node_with_target_repository_context() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository_id.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -264,6 +270,7 @@ async fn tree_emits_link_node_with_target_repository_context() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -331,6 +338,7 @@ async fn link_tree_path(
         immutable_store.clone(),
         mutable_store.clone(),
         repository_id.into(),
+        allow_all_repositories(),
     ));
 
     let main = lore_revision::branch::create(
@@ -386,6 +394,7 @@ async fn link_tree_path(
 
     branch_push::push(
         repository.clone(),
+        None,
         main,
         revision_hash,
         crate::util::test_support::PUSH_ANY,
@@ -462,6 +471,64 @@ async fn tree_marks_pinned_link_as_not_tracking() {
                 !link_path.tracking,
                 "a pinned (non-zero branch) link must not be reported as tracking",
             );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_cancelled_request_answers_cancelled() {
+    let repository = random::<Context>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    #[allow(clippy::large_futures)]
+    LORE_CONTEXT
+        .scope(execution.clone(), async move {
+            let write_token = get_write_token();
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let state = state::State::new();
+            state.set_revision_number(1);
+            let file_node = Node {
+                flags: NodeFlags::File.bits(),
+                name_hash: hash_string("file.txt"),
+                ..Default::default()
+            };
+            state
+                .node_add(repository.clone(), ROOT_NODE, file_node, "file.txt")
+                .await
+                .expect("Failed to add file node");
+            let revision_hash = state
+                .serialize(repository.clone(), &write_token)
+                .await
+                .expect("Failed to serialize state");
+
+            let mut request = Request::new(RevisionTreeRequest {
+                revision: revision_hash.into(),
+                path: String::new(),
+                max_depth: 0,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
+            );
+            let cancellation = lore_revision::runtime::Cancellation::new();
+            cancellation.cancel();
+            let err = lore_server::util::core_hop::with_request_cancellation(
+                cancellation,
+                handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all(),
+                ),
+            )
+            .await
+            .expect_err("a cancelled request returns no tree");
+            assert_eq!(err.code(), tonic::Code::Cancelled, "{err:?}");
         })
         .await;
 }

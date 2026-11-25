@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-30
+status: accepted
+date: 2026-11-13
 amended: 2026-11-11
 ---
 
@@ -43,8 +43,6 @@ A node is *tracked* for this purpose when it is staged, including a path staged 
 - An add marked dirty names a file nobody has asked to add, so a rule added after `lore dirty` marked it drops it again, as Git drops an untracked file a new `.gitignore` rule names. The same goes for an add `lore dirty --force` marked, until it is staged, and for each new directory above it that the mark creates.
 - A copy marked with `lore dirty copy` is a new node, so a copy into a directory the ignore file names is left out until it is staged.
 - A move marked with `lore dirty move` keeps the committed node it moves, so it stays tracked at its new path, even inside a directory the ignore file names. Git differs: a rename it has not staged leaves the destination untracked. `lore dirty move` is an explicit statement that the file moved, of content already committed, so it is kept.
-
-A new directory only marked dirty is recorded for staging only where it is empty; one holding nodes is carried by them, since staged or re-marked whole it would take in everything the working tree holds below it.
 
 A path is tracked as the kind of node the tree holds there. Revision 2055 asks the filter about each path as the file or directory it is, and a directory-only rule such as `Intermediate/` names directories alone. Where the working tree holds a directory at a path the tree holds a file at, or the reverse, the working-tree entry is new content and answers to the ignore file, and the tree's node is reported and staged deleted like any other (`State::tracks_as`).
 

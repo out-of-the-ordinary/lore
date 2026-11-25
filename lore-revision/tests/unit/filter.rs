@@ -668,3 +668,235 @@ fn a_staged_node_passes_the_view_slot_only_in_a_comparison() {
     assert!(!filter.excludes_tree(&child, false, FilterMode::CHANGES));
     assert!(filter.excludes_tree(&child, false, FilterMode::TRACKED));
 }
+
+/// The state `filter` steps a walk to at the directory `directory`, one component at a time from
+/// the root.
+fn walked_directory_state(filter: &FilterInstance, directory: &str) -> FilterState {
+    let mut walked = String::new();
+    let mut state = FilterState::ROOT;
+    for component in directory.split('/') {
+        if !walked.is_empty() {
+            walked.push('/');
+        }
+        walked.push_str(component);
+        state = filter.child_exclusion_state(state, &path(&walked), true);
+    }
+    state
+}
+
+/// The view creates each directory it keeps and none it excludes, whatever the directory holds:
+/// `/a` and `/a/` exclude `a` with everything in it, `/a/*` and `/a/**` exclude what `a` holds and
+/// keep `a`. A re-inclusion of `a` itself, `!/a` or `!/a/`, keeps `a` and everything in it, past
+/// `**` too; `!/a/*` and `!/a/**` keep what `a` holds and leave `a` excluded, and `!/a/*` reaches
+/// deeper only where no earlier line matches the deeper path itself. A later exclusion takes a
+/// directory out again. A walk and a whole-path query agree, and so does a step that reads the
+/// lines through the index.
+#[test]
+fn the_view_creates_each_directory_it_keeps_and_none_it_excludes() {
+    // Rules, directory, created.
+    let cases: &[(&[&str], &str, bool)] = &[
+        (&["/a"], "a", false),
+        (&["/a"], "a/b", false),
+        (&["/a/"], "a", false),
+        (&["/a/"], "a/b", false),
+        (&["/a/*"], "a", true),
+        (&["/a/*"], "a/b", false),
+        (&["/a/*"], "a/b/c", false),
+        (&["/a/**"], "a", true),
+        (&["/a/**"], "a/b", false),
+        (&["/a/**"], "a/b/c", false),
+        (&["/*", "!/a"], "a", true),
+        (&["/*", "!/a"], "a/b", true),
+        (&["/*", "!/a/"], "a", true),
+        (&["/*", "!/a/"], "a/b/c", true),
+        (&["/*", "!/a/"], "b", false),
+        (&["/*", "!/a/*"], "a", false),
+        (&["/*", "!/a/*"], "a/b", true),
+        (&["/*", "!/a/*"], "a/b/c", true),
+        (&["/*", "!/a/**"], "a", false),
+        (&["/*", "!/a/**"], "a/b", true),
+        (&["/*", "!/a/**"], "a/b/c", true),
+        (&["**", "!/a"], "a", true),
+        (&["**", "!/a"], "a/b/c", true),
+        (&["**", "!/a/"], "a", true),
+        (&["**", "!/a/"], "a/b/c", true),
+        (&["**", "!/a/*"], "a", false),
+        (&["**", "!/a/*"], "a/b", true),
+        (&["**", "!/a/*"], "a/b/c", false),
+        (&["**", "!/a/**"], "a", false),
+        (&["**", "!/a/**"], "a/b", true),
+        (&["**", "!/a/**"], "a/b/c", true),
+        (&["/a/*", "!/a/b/*"], "a/b", false),
+        (&["/a/*", "!/a/b/*"], "a/b/c", true),
+        (&["/a/*", "!/a/b/*"], "a/b/c/d", true),
+        (&["/a/**", "!/a/b/*"], "a/b", false),
+        (&["/a/**", "!/a/b/*"], "a/b/c", true),
+        (&["/a/**", "!/a/b/*"], "a/b/c/d", false),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo",
+            false,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar",
+            true,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something",
+            true,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something/specific",
+            false,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something/specific/deep",
+            false,
+        ),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/*"], "foo/bar", true),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/*"], "foo/bar/x", false),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/**"], "foo/bar/x", false),
+        (&["*.bat", "*.uasset"], "a", true),
+        (&["*.bat", "*.uasset"], "a/b", true),
+        (&["/*", "!*/Saved/Config/"], "engine", false),
+        (&["/*", "!*/Saved/Config/"], "engine/saved", false),
+        (&["/*", "!*/Saved/Config/"], "engine/saved/config", true),
+        (&["/*", "!*/Saved/Config/"], "engine/saved/config/sub", true),
+        (&["!/a/b/", "**", "!/a/"], "a/b", true),
+        (&["!/a/", "/a/"], "a", false),
+    ];
+    for (rules, directory, created) in cases {
+        for (layout, filter) in layouts(|filter| add_rules(filter, rules)) {
+            let walked = walked_directory_state(&filter, directory);
+            let states = FilterStates {
+                ignore: FilterState::ROOT,
+                view: walked,
+            };
+            assert_eq!(
+                states.creates_directory(),
+                *created,
+                "{rules:?} {layout} creates {directory}: {walked:?}"
+            );
+            assert_eq!(
+                filter.exclusion_state(&path(directory), true),
+                walked,
+                "{rules:?} {layout}: a whole-path query of {directory} agrees with the walk"
+            );
+        }
+    }
+}
+
+/// The directory rule reads the view slot alone: a directory the ignore file excludes and the
+/// view keeps is created, and one the view excludes is not, whatever the ignore file says.
+#[test]
+fn the_view_creates_a_directory_whatever_the_ignore_file_says() {
+    let mut ignore = FilterInstance::default();
+    add_rules(&mut ignore, &["/a/"]);
+    let mut view = FilterInstance::default();
+    add_rules(&mut view, &["/b/"]);
+    let filter = from_instances(ignore, view).expect("the filter");
+    for (directory, created) in [("a", true), ("b", false), ("c", true)] {
+        assert_eq!(
+            filter
+                .exclusion_states(&path(directory))
+                .creates_directory(),
+            created,
+            "{directory}"
+        );
+    }
+    assert!(
+        FilterStates::ROOT.creates_directory(),
+        "with no view, every directory is created"
+    );
+}
+
+/// A name rule of `*` and literal text, decided as the ending of the name, matches what the glob
+/// matches: the text alone, a longer name ending in it, the name at any depth, and no name that
+/// holds it elsewhere; a rule with more syntax after the `*` is still evaluated as a glob.
+#[test]
+fn a_name_rule_ending_in_literal_text_matches_as_its_glob_does() {
+    // Rule, path, excluded.
+    let cases: &[(&str, &str, bool)] = &[
+        ("*.ini", "a.ini", true),
+        ("*.ini", ".ini", true),
+        ("*.INI", "a/b/c.ini", true),
+        ("*.ini", "ini", false),
+        ("*.ini", "a.ini.bak", false),
+        ("*", "a", true),
+        ("*.i?i", "a.ixi", true),
+        ("*.i?i", "a.ini.x", false),
+        ("*[.]ini", "a.ini", true),
+        ("*.{ini,txt}", "a.txt", true),
+        ("*.{ini,txt}", "a.{ini,txt}", false),
+    ];
+    for (rule, file, excluded) in cases {
+        let mut filter = FilterInstance::default();
+        add_rules(&mut filter, &[rule]);
+        assert_eq!(
+            filter.exclusion_state(&path(file), false).excluded(),
+            *excluded,
+            "{rule} on {file}"
+        );
+    }
+}
+
+/// The view hides everything below a directory only where a line that applies below it excludes
+/// every name and no later rule can re-include anything there, and every child and grandchild a
+/// walk meets below such a directory is excluded with its subtree.
+#[test]
+fn the_view_hides_everything_below_a_directory_only_where_it_is_certain() {
+    // Rules, directory, hidden below.
+    let cases: &[(&[&str], &str, bool)] = &[
+        (&["**", "!/a/b/", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/", "/a/b/**"], "a/b", true),
+        (&["!/a/b/", "/a/**"], "a/b", true),
+        (&["!/a/b/k.txt", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/k.txt", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/k.txt", "/a/b/*", "!*.bat"], "a/b", true),
+        (&["**"], "a", true),
+        (&["!/a/", "*"], "a", true),
+        (&["**", "!/a/"], "a", false),
+        (&["**", "!/a/b/", "/a/b/*"], "a", false),
+        (&["**", "!/a/b/", "/a/b/*", "!/a/b/k.txt"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/*", "!*.bat"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/x*"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/*/"], "a/b", false),
+        (&["**", "!/a/b/", "/a/*/*"], "a/b", false),
+        (&["*.bat"], "a", false),
+    ];
+    for (rules, directory, hidden) in cases {
+        for (layout, instance) in layouts(|filter| add_rules(filter, rules)) {
+            let mut filter = Filter::default();
+            filter.view = instance;
+            let at = path(directory);
+            let states = filter.exclusion_states(&at);
+            assert_eq!(
+                filter.view_hides_below(states, &at),
+                *hidden,
+                "{rules:?} {layout} hides below {directory}"
+            );
+            if !*hidden {
+                continue;
+            }
+            for name in ["x", "k.txt", "y.bat", "s000"] {
+                for is_directory in [false, true] {
+                    let child = path(&format!("{directory}/{name}"));
+                    let (child_states, excluded) =
+                        filter.child_excludes_tree(states, &child, is_directory, FilterMode::View);
+                    assert!(excluded, "{rules:?} {layout} keeps {child}");
+                    let below = path(&format!("{directory}/{name}/k.txt"));
+                    assert!(
+                        filter
+                            .child_excludes_tree(child_states, &below, false, FilterMode::View)
+                            .1,
+                        "{rules:?} {layout} keeps {below}"
+                    );
+                }
+            }
+        }
+    }
+}

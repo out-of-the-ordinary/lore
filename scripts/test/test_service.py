@@ -7,26 +7,41 @@ import os
 import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
 
-from lore import Lore
+from lore import Lore, external_root, strip_protocol
 from service_util import (
     LORE_NO_SERVICE_EXECUTABLE_MESSAGE,
     LORE_NO_SERVICE_MESSAGE,
     LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_RUNNING_MESSAGE,
+    FRAME_MESSAGE,
+    FRAME_REFUSAL,
+    FRAME_STOP,
+    FRAME_STOP_RESULT,
     SERVICE_UNAVAILABLE,
+    read_frame,
     service_claim_path,
+    service_socket_path,
+    uds_accept,
+    uds_connect,
+    uds_listen,
+    write_frame,
+    write_hello,
     stop_lore_service,
     LORE_SERVICE_STATUS_LABELS,
+    LORE_EXTERNAL_ROOT_STATUS_LABELS,
 )
+from test_repository_info import get_instance_id
 
 logger = logging.getLogger(__name__)
 
@@ -330,8 +345,11 @@ def test_status_reports_the_running_service_and_its_metadata(
     assert LORE_NO_SERVICE_MESSAGE not in status, (
         f"status must not report the service as not running: {status}"
     )
-    for label in LORE_SERVICE_STATUS_LABELS:
+    for label in LORE_SERVICE_STATUS_LABELS + LORE_EXTERNAL_ROOT_STATUS_LABELS:
         assert label in status, f"status must report {label!r}: {status}"
+    assert "Runs inside another program: no" in status, (
+        f"the service the CLI runs is its own program: {status}"
+    )
 
     # The whole path rather than the file name, which every build of the client
     # shares: this is what makes the report worth reading, because an operator
@@ -372,11 +390,52 @@ def test_status_reports_no_service_rather_than_failing_to_reach_one(
         assert label not in status, (
             f"status must not report {label!r} with no service running: {status}"
         )
+    # The external directories belong to the global data directory, not to a
+    # service, so they are reported either way.
+    for label in LORE_EXTERNAL_ROOT_STATUS_LABELS:
+        assert label in status, (
+            f"status must report {label!r} with no service running: {status}"
+        )
 
     # Asking did not start one: a query must not change what it reports on.
     assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
         repo.lore_executable_path, lore_service_runner.global_dir_name
     ), "status must not start a service in order to report on one"
+
+
+@pytest.mark.smoke
+def test_start_against_a_running_service_prints_what_it_buffered(
+    new_lore_repo, global_dir_name, lore_service_runner
+):
+    """`service start` against a running service asks it for its status, and
+    prints the messages the service buffered while no command ran, as logs of
+    their level, and nothing else of the status.
+
+    A file stands where a registered shared store would be, so the service warns
+    at start that it can't open it. `service run` drains nothing, so the warning
+    is still buffered when the start asks."""
+    repo: Lore = new_lore_repo()
+    broken_store = Path(global_dir_name) / "a-file-in-place-of-a-shared-store"
+    broken_store.write_text("")
+    registry_path = Path(global_dir_name) / "data" / "stores" / "registry.toml"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(registry_path, "a") as registry_file:
+        registry_file.write(
+            '\n[[entries]]\n'
+            'remote_url = "lore://broken"\n'
+            f"path = '{broken_store}'\n"
+        )
+    lore_service_runner.start()
+
+    started = repo.run(["service", "start"])
+
+    assert f"Unable to open shared store at {broken_store}" in started, (
+        f"the start prints the warning the service buffered: {started}"
+    )
+    for label in LORE_SERVICE_STATUS_LABELS + LORE_EXTERNAL_ROOT_STATUS_LABELS:
+        assert label not in started, (
+            f"the start prints none of the status's {label!r}: {started}"
+        )
 
 
 @pytest.mark.smoke
@@ -1012,4 +1071,440 @@ def test_a_second_service_exits_rather_than_take_the_socket(
     assert first.poll() is None, "the first service still runs"
     assert LORE_SERVICE_RUNNING_MESSAGE in status.stdout.splitlines(), (
         f"the first service still answers: {status.stdout}{status.stderr}"
+    )
+
+
+# Schemas no build has: a hello carrying them is one from a client of another
+# build.
+FOREIGN_SCHEMAS = (0x1111111111111111, 0x2222222222222222)
+
+
+def run_service_command(
+    lore_service_runner, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Runs `lore service <args>` against this run's socket."""
+    return subprocess.run(
+        [lore_service_runner.lore_executable_path, "service", *args],
+        capture_output=True,
+        text=True,
+        env=lore_service_runner.lore_subprocess_env,
+        check=False,
+        timeout=60,
+    )
+
+
+@pytest.mark.smoke
+def test_a_service_refuses_a_client_of_another_build(
+    lore_service_runner, lore_service_socket
+):
+    """A service refuses a client whose message schemas differ from its own,
+    before it decodes the command the client sent after its hello, says why,
+    and goes on serving clients of its own build. The refusal reaches the
+    service's log, which `service status` hands back."""
+    service = lore_service_runner.start()
+
+    with uds_connect(service_socket_path(lore_service_socket)) as connection:
+        connection.settimeout(30)
+        write_hello(connection, *FOREIGN_SCHEMAS)
+        # A command its service would fail to decode, sent back-to-back with
+        # the hello as a client sends its first.
+        write_frame(connection, FRAME_MESSAGE, b"not a command of this build")
+        answer = read_frame(connection)
+        assert answer is not None, "the service closed without answering"
+        kind, payload = answer
+        reason = payload.decode()
+        assert kind == FRAME_REFUSAL, (
+            f"expected a refusal, got frame {kind}: {payload!r}"
+        )
+        assert reason, "the refusal gives a reason"
+        assert read_frame(connection) is None, "the service closes a refused connection"
+
+    status = run_service_command(lore_service_runner, "status")
+    output = status.stdout + status.stderr
+    assert service.poll() is None, f"the service exited on the refusal: {output}"
+    assert status.returncode == 0, f"the service serves its own build: {output}"
+    assert reason in output, f"the refusal reaches the service's log: {output}"
+
+
+@pytest.mark.smoke
+def test_a_service_stops_on_the_stop_request_of_a_client_of_another_build(
+    lore_service_runner, lore_service_socket
+):
+    """A stop carries no hello, so a service honours it from a client of any
+    build: that is how a client replaces a service of another build."""
+    service = lore_service_runner.start()
+
+    with uds_connect(service_socket_path(lore_service_socket)) as connection:
+        connection.settimeout(30)
+        write_frame(connection, FRAME_STOP, bytes([False]))  # Not forced.
+        answer = read_frame(connection)
+    assert answer is not None, "the service closed without answering the stop"
+    kind, payload = answer
+    assert kind == FRAME_STOP_RESULT, f"expected a stop result, got frame {kind}"
+    status = int.from_bytes(payload[:4], "little", signed=True)
+    assert (status, payload[4:]) == (0, b""), f"the stop failed: {payload!r}"
+    try:
+        code = service.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the service did not exit on the stop")
+    assert code == 0, f"the service exits cleanly on a stop, got exit code {code}"
+
+
+@contextlib.contextmanager
+def fake_service(socket_name: str, answer):
+    """Listens on `socket_name` in place of a service, handing each connection
+    to `answer`, which plays a service of another build."""
+    path = service_socket_path(socket_name)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    listener = uds_listen(path)
+    stopping = threading.Event()
+
+    def serve():
+        while True:
+            connection = uds_accept(listener)
+            with connection:
+                if stopping.is_set():
+                    return
+                connection.settimeout(30)
+                answer(connection)
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    try:
+        yield
+    finally:
+        stopping.set()
+        # Wakes the accept the server waits in, so that it sees it is stopping.
+        uds_connect(path).close()
+        server.join(timeout=30)
+        listener.close()
+        path.unlink(missing_ok=True)
+
+
+def answer_as_an_older_protocol(connection: socket.socket):
+    """Answers as a service built before the handshake does: it reads the
+    first byte, finds a protocol it doesn't read, and closes the connection
+    without answering."""
+    connection.recv(1)
+
+
+# `MountsBusy`, which a service serving a busy mount refuses a stop with.
+# Paired with its `ffi_code` in `lore-base/src/error.rs`.
+MOUNTS_BUSY = 51
+
+
+@pytest.mark.smoke
+def test_a_stop_the_service_refuses_reports_why(
+    lore_service_runner, lore_service_socket, stops_background_services
+):
+    """A service that refuses a stop, as one serving a busy mount does,
+    answers with the status and its reason. The client exits with that status
+    and prints the reason, which is all a user has to go on. Played by a fake
+    service, since only a busy FUSE mount makes a real one refuse."""
+    reason = "Mounts are busy: /a-mount-a-shell-is-in"
+
+    def refuse_the_stop(connection: socket.socket):
+        request = read_frame(connection)
+        assert request is not None and request[0] == FRAME_STOP, request
+        write_frame(
+            connection,
+            FRAME_STOP_RESULT,
+            MOUNTS_BUSY.to_bytes(4, "little", signed=True) + reason.encode(),
+        )
+
+    with fake_service(lore_service_socket, refuse_the_stop):
+        stop = run_service_command(lore_service_runner, "stop")
+    output = stop.stdout + stop.stderr
+    assert stop.returncode == MOUNTS_BUSY, (
+        f"the stop exits with the status the service refused it with: {output}"
+    )
+    assert reason in output, f"the stop prints the service's reason: {output}"
+
+
+@pytest.mark.smoke
+def test_a_client_reports_a_service_of_an_older_protocol_as_unavailable(
+    lore_service_runner, lore_service_socket, stops_background_services
+):
+    """A service that predates the handshake closes the connection rather than
+    answer the hello. The client fails a command and a stop with the
+    service-unavailable code, rather than as an internal error."""
+    with fake_service(lore_service_socket, answer_as_an_older_protocol):
+        for command in ("status", "stop"):
+            result = run_service_command(lore_service_runner, command)
+            output = result.stdout + result.stderr
+            assert result.returncode == SERVICE_UNAVAILABLE, (
+                f"`service {command}` exits with the service-unavailable code "
+                f"{SERVICE_UNAVAILABLE}, got {result.returncode}: {output}"
+            )
+
+
+# `InvalidArguments`: a refused target of `service set-external-directory`.
+INVALID_ARGUMENTS = 3
+# What `service status` prints of the external root's state while a move hasn't finished.
+EXTERNAL_ROOT_MOVING = "a move hasn't finished"
+
+
+def external_root_repo(
+    new_lore_repo, global_dir_name: str, registered: bool = False
+) -> tuple[Lore, str, str]:
+    """A repository over a shared store, with an external directory planted for it at the
+    default location as a virtual instance's would be, whose config names that store, and
+    named for the repository's instance where `registered`. Answers the repository, the
+    planted external directory's name, and the store."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.shared_store_create(repo.remote)
+    repo.repository_create(use_shared_store=True)
+    name = get_instance_id(repo.repository_info()) if registered else uuid.uuid4().hex
+    dot_lore = Path(external_root(global_dir_name)) / name / ".lore"
+    dot_lore.mkdir(parents=True)
+    shutil.copyfile(Path(repo.dot_path()) / "config.toml", dot_lore / "config.toml")
+    (dot_lore.parent / "file").write_text("kept")
+    store = repo.shared_store_info().stores[strip_protocol(repo.remote)].path
+    return repo, name, store
+
+
+def _wait_for(condition, what: str, timeout: float = 60.0):
+    deadline = monotonic() + timeout
+    while not condition():
+        assert monotonic() < deadline, f"timed out waiting for {what}"
+        sleep(0.1)
+
+
+@contextlib.contextmanager
+def held_store(store: str):
+    """Holds the lock file of the shared store `store` with an OS lock of the test's own, as
+    another process holding the store does."""
+    import fcntl
+
+    with open(Path(store) / "immutable" / "lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _set_external_directory_process(repo: Lore, target: Path) -> subprocess.Popen:
+    """`service set-external-directory` to `target`, run in the background."""
+    return subprocess.Popen(
+        [repo.lore_executable_path, "service", "set-external-directory", str(target)],
+        env=repo.sandboxed_env(),
+        cwd=repo.path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_moves_the_root_by_rename_and_back(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """A move by rename stops the running service, moves the external directories with the
+    root, leaves the redirect at the default location, and starts the service again; moving
+    back puts the root at the default location."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    default = Path(global_dir_name) / "data" / "external"
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    repo.service_set_external_directory(target)
+
+    assert (target / name / "file").read_text() == "kept"
+    assert Path(external_root(global_dir_name)) == target
+    assert default.is_symlink() or default.is_junction()
+    assert default.resolve() == target.resolve()
+    status = repo.service_status()
+    assert LORE_SERVICE_RUNNING_MESSAGE in status, status
+    assert str(target) in status, status
+
+    repo.service_set_external_directory("")
+
+    assert (default / name / "file").read_text() == "kept"
+    assert not default.is_symlink() and not default.is_junction()
+    assert not target.exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_moves_the_root_by_copy_and_back(
+    new_lore_repo, global_dir_name, apfs_volume, stops_background_services
+):
+    """On macOS, a move to another volume stops the running service, copies the external
+    directories to the target, leaves the redirect at the default location, and starts the
+    service again; moving back copies them to the default location and sets the target aside."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    default = Path(global_dir_name) / "data" / "external"
+    repo.service_start()
+    target = apfs_volume / "root"
+
+    repo.service_set_external_directory(target)
+
+    assert (target / name / "file").read_text() == "kept"
+    assert Path(external_root(global_dir_name)) == target
+    assert default.is_symlink()
+    assert default.resolve() == target.resolve()
+    status = repo.service_status()
+    assert LORE_SERVICE_RUNNING_MESSAGE in status, status
+    assert str(target) in status, status
+
+    repo.service_set_external_directory("")
+
+    assert (default / name / "file").read_text() == "kept"
+    assert not default.is_symlink()
+    assert not target.exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_dry_run_and_refusals(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """A dry run changes nothing, and the CLI refuses a target that
+    exists, one inside the current root, and `--adopt` with `--abandon`, with
+    `InvalidArguments`."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    target = scratch_dir("external-root") / "root"
+
+    repo.service_set_external_directory(target, dry_run=True)
+
+    assert not target.exists()
+    assert not (Path(global_dir_name) / "data" / "external-root").exists()
+    root = Path(external_root(global_dir_name))
+    existing = scratch_dir("external-root-existing", create=True)
+    for refused, options in [
+        (existing, {}),
+        (root / name / "inside", {}),
+        (target, {"adopt": True, "abandon": True}),
+    ]:
+        with pytest.raises(Exception) as error:
+            repo.service_set_external_directory(refused, **options)
+        assert error.value.returncode == INVALID_ARGUMENTS, (refused, options)
+    assert (root / name / "file").read_text() == "kept"
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_adopt_and_abandon(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """`--adopt` points the setting at a copy of the root and makes the redirect lead there;
+    `--abandon` gives up a root that is gone for a new, empty one."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    first = scratch_dir("external-root") / "root"
+    repo.service_set_external_directory(first)
+    copy = scratch_dir("external-root-copy")
+    shutil.copytree(first, copy, symlinks=True)
+
+    repo.service_set_external_directory(copy, adopt=True)
+
+    assert Path(external_root(global_dir_name)) == copy
+    assert (copy / name / "file").read_text() == "kept"
+    assert (Path(global_dir_name) / "data" / "external").resolve() == copy.resolve()
+
+    shutil.rmtree(copy)
+    new = scratch_dir("external-root-new") / "root"
+    repo.service_set_external_directory(new, abandon=True)
+
+    assert Path(external_root(global_dir_name)) == new
+    assert [entry.name for entry in new.iterdir()] == [".lore-external-root"]
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="holds the store with flock")
+def test_calls_during_a_move_that_waits_for_a_held_store(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """While a move waits for a store another process holds, the occupied socket answers each
+    call: a relayed command in an ordinary instance and one outside any instance run in their
+    own process, status reports the move, and stop and start fail. Once the store is free,
+    the move finishes and a service runs again."""
+    repo, name, store = external_root_repo(new_lore_repo, global_dir_name)
+    ordinary: Lore = new_lore_repo()
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    with held_store(store):
+        moving = _set_external_directory_process(repo, target)
+        _wait_for(
+            lambda: EXTERNAL_ROOT_MOVING in repo.service_status(check=False),
+            "the move to wait for the store",
+        )
+        relayed = {**LORE_SERVICE_ENVIRONMENT}
+        ordinary.environment_vars.update(relayed)
+        ordinary.run(["status"])
+        ordinary.run(
+            ["shared-store", "list"],
+            use_os_dir=True,
+            cwd=str(scratch_dir("outside", create=True)),
+        )
+        for refused in (["service", "stop"], ["service", "start"]):
+            with pytest.raises(Exception) as error:
+                repo.run(refused)
+            assert error.value.returncode == SERVICE_UNAVAILABLE, refused
+        assert moving.poll() is None, "the move waits while the store is held"
+
+    output, _ = moving.communicate(timeout=120)
+    assert moving.returncode == 0, output
+    assert (target / name / "file").read_text() == "kept"
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_a_refusal_after_the_stop_leaves_a_service_running(
+    new_lore_repo, global_dir_name, stops_background_services
+):
+    """A target inside the path of a registered virtual instance is refused once the service
+    is stopped, with `InvalidArguments`, and the service is started again."""
+    repo, _, _ = external_root_repo(new_lore_repo, global_dir_name, registered=True)
+    caller: Lore = new_lore_repo()
+    registered = Path(repo.path)
+    # The registered instance's path empties, as an unmounted virtual instance's does, so
+    # only the registration tells that the target lies inside it.
+    shutil.rmtree(registered)
+    caller.service_start()
+
+    with pytest.raises(Exception) as error:
+        caller.service_set_external_directory(registered / "root")
+
+    assert error.value.returncode == INVALID_ARGUMENTS
+    assert not (Path(global_dir_name) / "data" / "external-root").exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in caller.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform != "linux", reason="sends SIGINT")
+def test_sigint_during_a_move_undoes_it_and_starts_the_service_again(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """SIGINT to the CLI while the move waits for a held store undoes the move, and a service
+    runs again."""
+    repo, name, store = external_root_repo(new_lore_repo, global_dir_name)
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    with held_store(store):
+        moving = _set_external_directory_process(repo, target)
+        _wait_for(
+            lambda: EXTERNAL_ROOT_MOVING in repo.service_status(check=False),
+            "the move to wait for the store",
+        )
+        moving.send_signal(signal.SIGINT)
+        output, _ = moving.communicate(timeout=120)
+
+    assert moving.returncode != 0, output
+    assert not target.exists()
+    root = Path(external_root(global_dir_name))
+    assert (root / name / "file").read_text() == "kept"
+    assert not (Path(global_dir_name) / "data" / "external.move").exists()
+    _wait_for(
+        lambda: LORE_SERVICE_RUNNING_MESSAGE in repo.service_status(check=False),
+        "the service to run again",
     )

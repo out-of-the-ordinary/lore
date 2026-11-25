@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
 use tonic::Request;
@@ -31,7 +32,7 @@ use crate::grpc::handlers::branch_metadata_set::changes_protection;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
 use crate::grpc::require_action;
-use crate::grpc::require_repository_administration;
+use crate::grpc::require_branch_protection_administration;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -76,6 +77,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
@@ -131,7 +133,7 @@ pub async fn handler(
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
             if changes_protection(&current_metadata, &proposed_metadata) {
-                require_repository_administration(
+                require_branch_protection_administration(
                     authorizer,
                     &extensions,
                     repository.clone(),

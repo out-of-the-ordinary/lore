@@ -21,7 +21,7 @@ from lore_parsers import (
     parse_layer_list_json,
     parse_status_json,
 )
-from test_utils import to_posix
+from test_utils import staged_revision, status_revisions, to_posix, view_file
 
 from lore import Lore
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # The tree every test here commits. `assets/drop` is what a narrowing view drops,
 # `assets/keep` is what it keeps, and `keep.txt` is at the top level so a view
-# rooted at `/*` drops it while a view naming `assets/drop` does not.
+# rooted at `/*` drops it while a view excluding only `assets/drop` keeps it.
 TOP_LEVEL = "keep.txt"
 KEPT = os.path.join("assets", "keep", "keep.uasset")
 DROPPED = os.path.join("assets", "drop", "one.uasset")
@@ -41,10 +41,11 @@ FILE_BYTES = 256
 
 # Excludes the dropped directory and everything below it.
 NARROW_VIEW = ["/assets/drop"]
-# Excludes what the directory holds while leaving the directory node itself in
-# view, which has to stay materialized and empty -- the same shape `lore clone`
-# carries a regression test for.
+# Excludes what the directory holds and keeps the directory, so a clone and a sync
+# create it empty.
 EMPTIED_VIEW = ["/assets/drop/**"]
+# The same, with a line that keeps the directory before the exclusion.
+RE_INCLUDED_EMPTIED_VIEW = ["!/assets/drop/", "/assets/drop/**"]
 # The canonical shape of an authored view: drop everything at the top, re-include
 # the one tree wanted, then narrow within it. `*` cannot match below depth one, so
 # the re-included subtree's own children were never excluded.
@@ -116,19 +117,6 @@ def committed_repository(new_lore_repo) -> Lore:
     return repo
 
 
-def view_file(scratch_dir, name: str, rules: list[str]) -> str:
-    """A view filter file holding `rules`, one per line, beside the repositories.
-
-    Outside every working tree, since a file inside one would be part of the tree
-    the view change carries.
-    """
-    directory = scratch_dir("view", create=True)
-    path = os.path.join(directory, name + ".txt")
-    with open(path, "w+") as output_file:
-        output_file.writelines(rule + "\n" for rule in rules)
-    return path
-
-
 def sync_view(instance: Lore, view: str, **kwargs) -> tuple[str, Realized]:
     """Syncs `instance` under `view`, answering the event output and what it did."""
     output = instance.sync(view=view, json=True, **kwargs)
@@ -185,23 +173,9 @@ def assert_status_clean(instance: Lore, message: str) -> None:
     assert {to_posix(entry.get("path", "")) for entry in entries} == set(), message
 
 
-def status_revisions(instance: Lore) -> dict:
-    """What the instance reports of the revisions it stands on."""
-    entries = parse_jsonl(
-        instance.status(json=True, offline=True, revision_only=True),
-        "repositoryStatusRevision",
-    )
-    return entries[-1]
-
-
 def current_revision(instance: Lore) -> str:
     """The revision the instance's working tree stands on."""
     return status_revisions(instance)["revision"]
-
-
-def staged_revision(instance: Lore) -> str:
-    """The staged state the instance holds, which is zero while it holds none."""
-    return status_revisions(instance)["revisionStaged"]
 
 
 @pytest.mark.smoke
@@ -292,33 +266,41 @@ def test_sync_view_narrows_to_a_re_including_view(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_sync_view_keeps_a_directory_its_children_leave(new_lore_repo, scratch_dir):
-    """A view that drops what a directory holds while keeping the directory node
-    leaves it materialized and empty, which is what a clone with that view does.
+def test_sync_view_keeps_a_directory_its_children_leave_unless_the_view_excludes_it(
+    new_lore_repo, scratch_dir
+):
+    """A view that drops what a directory holds keeps the directory once its
+    children leave, unless the view excludes the directory too, and the tree then
+    holds what a clone with that view does.
 
-    The status that follows is what makes it matter: the node is in view, so an
-    instance missing the directory would report a phantom local delete of it.
+    Under `/assets/drop` the view excludes `assets/drop`, so the sync deletes the
+    two files and the directory. Under `/assets/drop/**`, with or without a line
+    keeping `assets/drop` before it, the view excludes only what the directory
+    holds, so the sync deletes the two files and keeps it empty. A scan reports no
+    changes.
     """
     repo = committed_repository(new_lore_repo)
-    instance = repo.clone()
-    emptied = view_file(scratch_dir, "emptied", EMPTIED_VIEW)
+    for name, rules, deleted, kept in [
+        ("excluded", NARROW_VIEW, 3, False),
+        ("emptied", EMPTIED_VIEW, 2, True),
+        ("re-included", RE_INCLUDED_EMPTIED_VIEW, 2, True),
+    ]:
+        instance = repo.clone()
+        view = view_file(scratch_dir, name, rules)
 
-    _output, realized = sync_view(instance, emptied)
+        _output, realized = sync_view(instance, view)
 
-    directory = os.path.join(instance.path, DROPPED_DIRECTORY)
-    assert os.path.isdir(directory), (
-        "a directory node in view stays materialized once its children leave"
-    )
-    assert os.listdir(directory) == [], (
-        f"every child is dropped by the view, found: {os.listdir(directory)}"
-    )
-    assert realized == Realized(files_written=0, bytes_written=0, files_deleted=2), (
-        "the two files leave and the directory the view still admits does not"
-    )
-    assert_status_clean(instance, "an emptied directory is not a phantom delete")
-    assert materialized(instance) == materialized(repo.clone(view=emptied)), (
-        "the tree holds what a clone with the same view would have"
-    )
+        directory = os.path.join(instance.path, DROPPED_DIRECTORY)
+        assert os.path.isdir(directory) == kept, f"{rules} keeps {DROPPED_DIRECTORY}"
+        assert realized == Realized(
+            files_written=0, bytes_written=0, files_deleted=deleted
+        ), (
+            f"under {rules}, the two files leave, and the directory where the view excludes it"
+        )
+        assert_status_clean(instance, f"{rules}: the tree agrees with the view")
+        assert materialized(instance) == materialized(repo.clone(view=view)), (
+            f"under {rules}, the tree holds what a clone with the same view would have"
+        )
 
 
 @pytest.mark.smoke
@@ -362,7 +344,9 @@ def test_sync_view_carries_a_revision_move_as_well(new_lore_repo, scratch_dir):
     assert_status_clean(instance, "the instance is coherent with revision and view")
 
 
-@pytest.mark.own_vfs("marks a file dirty without changing it, which a status on a virtual clone measures as unchanged")
+@pytest.mark.own_vfs(
+    "marks a file dirty without changing it, which a status on a virtual clone measures as unchanged"
+)
 @pytest.mark.smoke
 @pytest.mark.parametrize("force", [False, True])
 def test_sync_view_drops_dirty_flags_for_paths_leaving_the_view(

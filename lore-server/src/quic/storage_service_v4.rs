@@ -26,6 +26,7 @@ use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -238,9 +239,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(Some(&verified), repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(MessageHandleError::from_authorization)?;
                     token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
@@ -262,9 +261,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(None, repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(MessageHandleError::from_authorization)?;
                 }
 
                 let session_map = self.session_map.clone();
@@ -338,16 +335,21 @@ impl QuicService for StorageServiceV4 {
                 let permitted = match (action, enumerated) {
                     (Some(action), Some(None)) => {
                         let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
-                        let authorizer = &self.repository_authorizer;
-                        let mut permitted = authorizer
-                            .check_repository_access(verified.as_ref(), repository, action)
-                            .await
-                            .is_ok();
-                        if let (false, Some(alternative)) = (permitted, alternative) {
-                            permitted = authorizer
-                                .check_repository_access(verified.as_ref(), repository, alternative)
+                        let authorizer = self.repository_authorizer.as_ref();
+                        let mut permitted =
+                            permits_with(authorizer, None, verified.as_ref(), repository, action)
                                 .await
-                                .is_ok();
+                                .map_err(MessageHandleError::from_authorization)?;
+                        if let (false, Some(alternative)) = (permitted, alternative) {
+                            permitted = permits_with(
+                                authorizer,
+                                None,
+                                verified.as_ref(),
+                                repository,
+                                alternative,
+                            )
+                            .await
+                            .map_err(MessageHandleError::from_authorization)?;
                         }
                         permitted
                     }
@@ -435,11 +437,7 @@ impl QuicService for StorageServiceV4 {
                                     Action::Read,
                                 )
                                 .await
-                                .map_err(|status| {
-                                    MessageHandleError::AuthorizationFailure(
-                                        status.message().to_string(),
-                                    )
-                                })?;
+                                .map_err(MessageHandleError::from_authorization)?;
                             authorized_sources.insert(copy.source_repository);
                         }
                         handle_copy(

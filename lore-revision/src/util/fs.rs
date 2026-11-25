@@ -9,8 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
-use rand::distr::Alphanumeric;
-use rand::distr::SampleString;
 use tokio::task::JoinSet;
 
 use super::path::DepthPath;
@@ -26,7 +24,6 @@ use crate::lore_trace;
 use crate::lore_warn;
 use crate::node::NodeFileMode;
 use crate::repository::DOT_LORE;
-use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::is_reserved_node_name;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
@@ -50,7 +47,8 @@ pub async fn metadata_set_executable(
     }
 }
 
-/// Does nothing: Windows has no executable bit.
+/// Does nothing: Windows has no executable bit. Async to match the other platforms' signature.
+#[allow(clippy::unused_async)]
 #[cfg(target_family = "windows")]
 pub async fn set_executable(
     _path: impl AsRef<Path>,
@@ -396,7 +394,7 @@ pub async fn filesystem_path_and_info(
     #[cfg(target_os = "linux")]
     {
         let initial_path = candidate_path(base, find_path.as_str());
-        if let Ok(info) = operation.file_info(&initial_path).await
+        if let Ok(info) = operation.file_info_as_spelled(&initial_path).await
             && info.exists()
         {
             return Ok((find_path.clone(), Some(info)));
@@ -722,14 +720,4 @@ pub fn file_unlink_retry() -> Retry {
         .with_limit(10)
         .build()
         .retry()
-}
-
-pub fn generate_temppath(prefix: &str) -> std::path::PathBuf {
-    let name = format!(
-        "{prefix}-{}{TEMP_FILE_EXTENSION}",
-        Alphanumeric.sample_string(&mut rand::rng(), 16).as_str()
-    );
-    let mut path = std::env::temp_dir();
-    path.push(name);
-    path
 }

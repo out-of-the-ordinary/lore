@@ -12,6 +12,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::state::stream::ChangeStream;
 use lore_revision::util::path::RelativePath;
 
@@ -19,17 +20,25 @@ use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
 
 mod case_rename;
+mod deletion_walk;
 mod diff;
-mod instance;
+mod fast_forward_merge;
+mod held_before_replacement;
+pub(crate) mod instance;
+mod interrupted_commit;
 mod interrupted_push;
 mod last_merged;
 mod merge_deletions;
+mod merge_file_ids;
 mod merge_local_work;
 #[cfg(unix)]
 mod merge_modes;
 mod merge_moves;
+mod moved_out;
 mod remote_comparison;
+mod replaced_mounts;
 mod resolve;
+mod stale_directory;
 mod sync;
 mod sync_hold;
 mod tree_walk;
@@ -122,6 +131,7 @@ async fn the_target_walk_holds_no_change_beside_the_join() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let side = NodeChangeState {
@@ -147,8 +157,9 @@ async fn the_target_walk_holds_no_change_beside_the_join() {
                 &mut conflicting_mounts,
                 (&state, &state),
                 false,
+                LinkSettlement::Tree,
             );
-            let mut joined = Joined::new(0);
+            let mut joined = Joined::new(0, LinkSettlement::Tree);
             let join = joined.join(&[], change, Err(0), false);
 
             assert!(
@@ -193,6 +204,7 @@ async fn a_file_replaced_by_a_directory_conflicts_only_with_a_change_there_or_be
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let at = |text: &str| change_at(&repository, &state, text);
@@ -251,6 +263,7 @@ async fn nodes_of_different_types_added_at_one_path_conflict_there() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let added = |flags: NodeFlags| {

@@ -25,6 +25,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawn;
 use lore_base::runtime::TaskLifecycleObserver;
+use lore_base::runtime::report_serving_runtime;
 use lore_base::runtime::runtime;
 use lore_base::runtime::serving_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
@@ -34,6 +35,7 @@ use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_revision::runtime::execution_context;
+use lore_revision::store::composite::CompositeStore;
 use lore_revision::store::composite::CompositeStoreBuilder;
 use lore_revision::store::remote::RemoteImmutableStore;
 use lore_revision::store::remote::RemoteMutableStore;
@@ -42,20 +44,19 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::assume_server_policies;
 use lore_storage::compress::COMPRESSION_MODE;
+use lore_storage::flush_stores;
 use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_storage::local::store_lock::StoreHold;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
-use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::set_fallback_user_agent_product;
-use lore_transport::user_agent_product;
+use lore_transport::user_agent_with_component;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::UpDownCounter;
@@ -130,6 +131,7 @@ use crate::store::resolve_plugin_config_with_fallback;
 use crate::telemetry::OtelTokioRuntimeMetrics;
 use crate::telemetry::ResourceDetectorProvider;
 use crate::telemetry::TelemetryInitializer;
+use crate::telemetry::register_io_pool_metrics;
 use crate::tls::load_client_tls;
 use crate::topology::configure_topology_with_registry;
 use crate::util::setup_execution;
@@ -367,6 +369,10 @@ impl From<QuicSettings> for QuinnConfigBuilder {
             builder = builder.initial_cwnd(v);
         }
 
+        if let Some(v) = settings.congestion_algorithm {
+            builder = builder.congestion_algorithm(v);
+        }
+
         builder
     }
 }
@@ -384,7 +390,6 @@ async fn launch_quinn_server(
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
     metrics_frequency: Duration,
     quic_settings: QuicSettings,
-    congestion_algorithm: CongestionAlgorithm,
     generate_ephemeral_cert: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -421,8 +426,7 @@ async fn launch_quinn_server(
             .pkey_file(cert_settings.pkey_file)
             .client_cert_verifier(client_verifier)
             .stream_handler_factory(stream_handler_factory)
-            .metrics_frequency(metrics_frequency)
-            .congestion_algorithm(congestion_algorithm);
+            .metrics_frequency(metrics_frequency);
 
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
@@ -462,6 +466,7 @@ pub fn compiled_features() -> Vec<String> {
 async fn launch_grpc_server(
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     token_verification: TokenVerification,
@@ -529,7 +534,7 @@ async fn launch_grpc_server(
     GrpcServerBuilder::new()
         .with_environment(environment)
         .with_feature(feature)
-        .with_immutable_store(immutable_store, local_store)
+        .with_immutable_store(immutable_store, local_store, local_tier)
         .with_mutable_store(mutable_store)
         .with_lock_store(lock_store)
         .with_notification(notification_sender, notification_service)
@@ -920,14 +925,44 @@ impl StreamHandlerFactory for QuicInternalStreamHandler {
     }
 }
 
+struct ConfiguredImmutableStore {
+    /// The store the server reads through.
+    store: Arc<dyn ImmutableStore>,
+    /// The store that reads through `store` fill with what they read. `None` where they fill none.
+    local_tier: Option<Arc<dyn ImmutableStore>>,
+}
+
+impl ConfiguredImmutableStore {
+    fn without_local_tier(store: Arc<dyn ImmutableStore>) -> Self {
+        Self {
+            store,
+            local_tier: None,
+        }
+    }
+}
+
 async fn configure_immutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<ConfiguredImmutableStore> {
     let mode = &settings.immutable_store.mode;
 
-    match mode.as_str() {
+    if mode == store_mode::COMPOSITE {
+        let composite_settings = settings
+            .immutable_store
+            .composite
+            .as_ref()
+            .ok_or(anyhow!("Missing composite store settings"))?;
+        let composite =
+            configure_composite_store(registry, composite_settings, settings, topology).await?;
+        return Ok(ConfiguredImmutableStore {
+            local_tier: Some(composite.local()),
+            store: composite,
+        });
+    }
+
+    let store = match mode.as_str() {
         store_mode::LOCAL => {
             let local_settings = settings
                 .immutable_store
@@ -936,15 +971,6 @@ async fn configure_immutable_store_via_plugin(
                 .ok_or(anyhow!("Missing local immutable store settings"))?;
 
             configure_local_immutable_store(local_settings).await
-        }
-        store_mode::COMPOSITE => {
-            let composite_settings = settings
-                .immutable_store
-                .composite
-                .as_ref()
-                .ok_or(anyhow!("Missing composite store settings"))?;
-
-            configure_composite_store(registry, composite_settings, settings, topology).await
         }
         store_mode::REPLICATED => {
             let replicated_settings = settings
@@ -976,7 +1002,8 @@ async fn configure_immutable_store_via_plugin(
                 .create_immutable_store(mode, &plugin_config)
                 .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))
         }
-    }
+    }?;
+    Ok(ConfiguredImmutableStore::without_local_tier(store))
 }
 
 async fn configure_mutable_store_via_plugin(
@@ -1429,6 +1456,7 @@ async fn configure_local_mutable_store(
     .await?)
 }
 
+#[lore_macro::test_pub]
 fn configure_remote_immutable_store(
     settings: &RemoteStoreSettings,
     upstream_connections: u32,
@@ -1441,19 +1469,17 @@ fn configure_remote_immutable_store(
     Ok(Arc::new(
         RemoteImmutableStore::new(settings.remote_url.as_str(), settings.auth_url.as_deref())
             .verifying(settings.verify)
-            .connecting_over(upstream_connections as usize),
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
     ))
 }
 
-async fn configure_replicated_immutable_store(
+/// The factory of a replicated store's clients, each connecting to the remote as `settings`
+/// configure it.
+#[lore_macro::test_pub]
+fn replicated_client_factory(
     settings: &ReplicatedStoreSettings,
-) -> Result<Arc<dyn ImmutableStore>> {
-    info!(
-        remote_url = %settings.remote_url,
-        num_clients = settings.num_clients,
-        "Wiring up replicated immutable store"
-    );
-
+) -> client_container::QuicClientFactory {
     let certs = if let Some(setting_certs) = &settings.certs {
         let setting_certs = setting_certs.clone();
         client::CertificateSettings {
@@ -1486,10 +1512,21 @@ async fn configure_replicated_immutable_store(
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
     factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
-    factory.user_agent = Some(make_user_agent_with_component(
-        user_agent_product(),
-        "replicated-immutable-store",
-    ));
+    factory.transport_config.congestion_algorithm = settings.congestion_algorithm;
+    factory.user_agent = Some(user_agent_with_component("replicated-immutable-store"));
+    factory
+}
+
+async fn configure_replicated_immutable_store(
+    settings: &ReplicatedStoreSettings,
+) -> Result<Arc<dyn ImmutableStore>> {
+    info!(
+        remote_url = %settings.remote_url,
+        num_clients = settings.num_clients,
+        "Wiring up replicated immutable store"
+    );
+
+    let factory = replicated_client_factory(settings);
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1518,7 +1555,8 @@ fn configure_remote_mutable_store(
 
     Ok(Arc::new(
         RemoteMutableStore::new(settings.remote_url.as_str(), identity)
-            .connecting_over(upstream_connections as usize),
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
     ))
 }
 
@@ -1527,7 +1565,7 @@ async fn configure_composite_store(
     settings: &CompositeStoreSettings,
     global_settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<Arc<CompositeStore>> {
     info!("Wiring up Composite store");
 
     let mut composite_store_builder = CompositeStoreBuilder::default()
@@ -1630,6 +1668,9 @@ async fn configure_composite_store(
             Duration::from_secs(factory_settings.quic_client_monitor_interval_seconds);
         factory.enable_same_region_write = factory_settings.enable_same_region_write;
         factory.initial_cwnd_bytes = factory_settings.initial_cwnd_bytes;
+        factory.slow_response_threshold = factory_settings
+            .slow_response_threshold_ms
+            .map(Duration::from_millis);
 
         composite_store_builder = composite_store_builder.with_replica_builder(Arc::new(factory));
     }
@@ -1832,8 +1873,7 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .expect("Could not downcast store");
 
             let margin = std::env::var("LORE_SEEDING_MARGIN")
-                .map(|v| v.parse::<usize>().unwrap_or_default())
-                .unwrap_or_default();
+                .map_or_default(|v| v.parse::<usize>().unwrap_or_default());
 
             let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
                 v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)
@@ -1937,8 +1977,7 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
     fn detectors(&self, runtime_handle: Handle) -> Vec<Box<dyn ResourceDetector>> {
         let mut detectors = self
             .inner
-            .map(|provider| provider.detectors(runtime_handle.clone()))
-            .unwrap_or_default();
+            .map_or_default(|provider| provider.detectors(runtime_handle.clone()));
         detectors.extend(self.registry.resource_detectors(runtime_handle));
         detectors
     }
@@ -1983,7 +2022,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .init()?
     };
 
+    report_serving_runtime();
     observe_task_lifecycles();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::telemetry::observe_file_descriptors(&lore_telemetry::meter("lore.server"));
 
     let up_gauge = lore_telemetry::meter("urc.server")
         .u64_gauge("urc.server.up")
@@ -2021,6 +2064,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             }
         }));
     }
+
+    register_io_pool_metrics(&lore_telemetry::meter("lore.io.pool"));
 
     if let Some(mode) = settings
         .environment
@@ -2096,8 +2141,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         info!("Running in single-node mode (no topology configured)");
     }
 
-    let immutable_store =
-        configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
+    let ConfiguredImmutableStore {
+        store: immutable_store,
+        local_tier,
+    } = configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
 
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
@@ -2301,6 +2348,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             launch_grpc_server(
                 immutable_store,
                 local_immutable_store,
+                local_tier,
                 mutable_store,
                 lock_store,
                 token_verification,
@@ -2415,6 +2463,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
@@ -2440,7 +2491,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                CongestionAlgorithm::Bbr,
                 // User-facing endpoint: generate an ephemeral certificate when
                 // none is configured so the server runs with zero config.
                 true,
@@ -2526,6 +2576,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             launch_quinn_server(
@@ -2538,10 +2591,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                // Cubic only shrinks the window on packet loss, so a peer that goes quiet
-                // between replication bursts doesn't come back to a window BBR has drained
-                // and stall the next large get or put.
-                CongestionAlgorithm::Cubic,
                 generate_ephemeral_cert,
                 shutdown_rx,
             )
@@ -2614,16 +2663,22 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
-    let _ = immutable_store.flush(FlushOptions::SYNC_DATA).await;
-    let _ = mutable_store.flush(FlushOptions::SYNC_DATA).await;
+    if let Err(error) = flush_stores(
+        immutable_store,
+        Some(mutable_store),
+        FlushOptions::SYNC_DATA,
+    )
+    .await
+    {
+        warn!(%error, "Failed to flush the stores at shutdown");
+    }
 
     Ok(hold)
 }
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {
     let correlation_id = lore_revision::lore::try_execution_context()
-        .map(|e| e.dispatcher.correlation_id.clone())
-        .unwrap_or_default();
+        .map_or_default(|e| e.dispatcher.correlation_id.clone());
 
     match level {
         lore_base::log::LoreLogLevel::None | lore_base::log::LoreLogLevel::Trace => {

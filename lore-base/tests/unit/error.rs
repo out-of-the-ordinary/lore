@@ -139,6 +139,7 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             Group::Connectivity,
             ServiceUnavailable { reason: text() }.ffi_code(),
         ),
+        ("Cancelled", Group::Connectivity, Cancelled.ffi_code()),
         (
             "NothingStaged",
             Group::RepositoryState,
@@ -196,6 +197,15 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             LinkDivergent {
                 path: text(),
                 branch: text(),
+            }
+            .ffi_code(),
+        ),
+        (
+            "LinkPinsDiverge",
+            Group::RepositoryState,
+            LinkPinsDiverge {
+                repository: text(),
+                mounts: text(),
             }
             .ffi_code(),
         ),

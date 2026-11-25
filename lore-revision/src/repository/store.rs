@@ -25,7 +25,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Result of a query against the immutable store for a single fragment.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStoreImmutableQueryEventData {
     /// Address of fragment
@@ -173,7 +173,11 @@ async fn immutable_query_address(
     {
         // Query the subfragments
         let payload = payload.to_aligned::<FragmentReference>();
-        for reference in payload.as_type_slice::<FragmentReference>() {
+        for reference in payload
+            .as_type_slice::<FragmentReference>()
+            .iter()
+            .filter(|reference| !reference.is_hole())
+        {
             let repository = repository.clone();
             let reference_address = Address {
                 hash: reference.hash,

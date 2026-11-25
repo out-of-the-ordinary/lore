@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
+use lore_credential::is_expired;
+use lore_credential::is_token_expired;
 use lore_credential::token_store::vulnerable_all_tokens;
 use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::UserService;
-use lore_transport::auth::exchange::is_expired;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -50,7 +51,9 @@ impl EventError for UserInfoError {
 
 /// Event data resolving a user identity to a display name.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserInfoEventData {
     /// User identity
@@ -61,7 +64,9 @@ pub struct LoreAuthUserInfoEventData {
 
 /// Event data describing a stored authentication identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthIdentityEventData {
     /// Auth service URL
@@ -76,6 +81,8 @@ pub struct LoreAuthIdentityEventData {
     pub expires: u64,
     /// Cached token (only populated when requested)
     pub token: LoreString,
+    /// The token's claims as a JSON object (only populated when requested)
+    pub claims: LoreString,
 }
 
 struct UserServiceAccess {
@@ -188,8 +195,7 @@ pub(crate) async fn resolve_user_info(
     };
     let auth_url = remote
         .as_ref()
-        .map(|remote| remote.auth_url().to_string())
-        .unwrap_or_default();
+        .map_or_default(|remote| remote.auth_url().to_string());
 
     let user_ids_vec: Vec<String> = ids
         .as_slice()
@@ -282,9 +288,11 @@ pub fn resolve_user_info_boxed(
 }
 
 /// Emits the authorization (access) token for the repository as an
-/// [`LoreEvent::AuthIdentity`] event.
+/// [`LoreEvent::AuthIdentity`] event, as [`access_token_event`] describes.
 pub async fn repository_access_token(
     repository: Arc<RepositoryContext>,
+    with_token: bool,
+    with_claims: bool,
 ) -> Result<(), UserInfoError> {
     let remote = repository
         .remote()
@@ -309,27 +317,61 @@ pub async fn repository_access_token(
     .await
     .forward::<UserInfoError>("Failed authorization token exchange")?;
 
+    LoreEvent::AuthIdentity(access_token_event(
+        auth_url,
+        repository.id,
+        user_id,
+        token,
+        with_token,
+        with_claims,
+    )?)
+    .send();
+
+    Ok(())
+}
+
+/// The [`LoreEvent::AuthIdentity`] data for the authorization `token` of
+/// `user_id` on `repository`. It carries the token only with `with_token`, and
+/// the token's claims as compact JSON only with `with_claims`, which fails with
+/// `NotSupported` when `token` is not a JWT.
+#[lore_macro::test_pub]
+fn access_token_event(
+    auth_url: String,
+    repository: RepositoryId,
+    user_id: String,
+    token: String,
+    with_token: bool,
+    with_claims: bool,
+) -> Result<LoreAuthIdentityEventData, UserInfoError> {
     // Expiry and authorized domains come from the token itself, matching what
     // `auth list` reports for stored authorization entries.
     let (authorized_domains, expires) = match lore_credential::insecure_decode_token(&token) {
         Ok(decoded) => (
             decoded.claims.acceptable_root_domains().join(", "),
-            decoded.claims.expires * 1000,
+            decoded.claims.expires.saturating_mul(1000),
         ),
         Err(_) => (String::new(), 0),
     };
+    let claims = if with_claims {
+        lore_credential::insecure_decode_claims(&token)
+            .map_err(|err| NotSupported {
+                operation: format!("showing the claims of a token that is not a JWT: {err}"),
+            })?
+            .to_string()
+    } else {
+        String::new()
+    };
+    let token = if with_token { token } else { String::new() };
 
-    LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
+    Ok(LoreAuthIdentityEventData {
         auth_url: auth_url.into(),
-        resource: repository.id.to_string().into(),
+        resource: repository.to_string().into(),
         user_id: user_id.into(),
         authorized_domains: authorized_domains.into(),
         expires,
         token: token.into(),
+        claims: claims.into(),
     })
-    .send();
-
-    Ok(())
 }
 
 /// Strip every occurrence of the current-user id from the input list.
@@ -351,7 +393,9 @@ fn strip_current_user(ids: Vec<String>, current_user_id: &str) -> (bool, Vec<Str
 
 /// Event data carrying a user token along with the identity it belongs to.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserTokenEventData {
     /// User identity
@@ -405,15 +449,20 @@ impl ResolvedIdentity {
     pub fn session_valid(&self) -> bool {
         self.local_user_info
             .as_ref()
-            .is_some_and(|info| session_valid(info.expires, self.refresh_expires))
+            .is_some_and(|info| token_session_valid(info, self.refresh_expires))
     }
 }
 
-/// Whether a login is still usable: its token, expiring at `expires`, has not expired, or a
-/// refresh token can still renew it. `refresh_expires` is `None` without a refresh token, and
-/// `Some(0)` for one with no deadline.
-pub fn session_valid(expires: u64, refresh_expires: Option<u64>) -> bool {
-    if !is_expired(expires) {
+/// Whether a login described by `info` is still usable: its token has not expired (measured
+/// against `lifetime_ms` or `iat` and `received_at` when available), or a refresh token can still
+/// renew it.
+pub fn token_session_valid(info: &lore_credential::UserInfo, refresh_expires: Option<u64>) -> bool {
+    if !is_token_expired(
+        info.issued_at,
+        info.expires,
+        info.received_at,
+        info.lifetime_ms,
+    ) {
         return true;
     }
     match refresh_expires {

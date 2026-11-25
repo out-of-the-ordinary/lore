@@ -19,7 +19,6 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use lore_io::StatKind;
 use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
@@ -31,10 +30,12 @@ use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::errors::NodeNotFound;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
 use crate::fs::filesystem_provider::ChainRoot;
+use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
@@ -50,6 +51,9 @@ use crate::repository::RepositoryContext;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::is_reserved_node_name;
+use crate::stage::Absence;
+use crate::stage::AbsentChildren;
+use crate::stage::holds_pending_merge_change;
 use crate::state::ChangeSender;
 use crate::state::DiffSide;
 use crate::state::diff::NodeMatch;
@@ -176,7 +180,7 @@ enum NamedRoot {
     Walk(FilterStates, crate::fs::os::PathListingResult),
     /// Replace the file the tree holds there with the directory the working tree holds, from the
     /// verdict at it.
-    Replaced(FilterStates, lore_io::DirStream),
+    Replaced(FilterStates, crate::fs::os::EntryListing),
     /// Report the node the tree holds there missing, from the verdict at it.
     Missing(FilterStates),
     /// Leave the path out.
@@ -239,9 +243,7 @@ async fn named_root(
     ctx: &FilesystemDiffContext,
     absolute_path: std::path::PathBuf,
 ) -> Result<NamedRoot, StateError> {
-    let listing = crate::fs::os::list_path(absolute_path)
-        .await
-        .forward::<StateError>("Failed to list the path")?;
+    let listing = list_walk_path(ctx, absolute_path).await?;
     let filter = &ctx.from.repository.filter;
     let path = &ctx.filesystem_path;
     let held = async || {
@@ -251,7 +253,8 @@ async fn named_root(
             .await
     };
     let listed = match &listing {
-        crate::fs::os::PathListingResult::Directory { .. } => true,
+        crate::fs::os::PathListingResult::Directory { .. }
+        | crate::fs::os::PathListingResult::Unlistable => true,
         crate::fs::os::PathListingResult::File { .. } => false,
         crate::fs::os::PathListingResult::NotFound => {
             let node = held().await;
@@ -302,6 +305,93 @@ async fn named_root(
     })
 }
 
+/// What the working tree holds at the walk's path: read through the operation where it answers for
+/// the tree itself, and from the file system otherwise.
+async fn list_walk_path(
+    ctx: &FilesystemDiffContext,
+    absolute_path: std::path::PathBuf,
+) -> Result<crate::fs::os::PathListingResult, StateError> {
+    if ctx.operation.lists_through_operation() {
+        return list_through_operation(&ctx.operation, &ctx.filesystem_path).await;
+    }
+    crate::fs::os::list_path(absolute_path)
+        .await
+        .forward::<StateError>("Failed to list the path")
+}
+
+/// What an operation that answers for the tree itself says is at `path`, in the shape
+/// [`crate::fs::os::list_path`] gives for the file system: a directory with its entries, a file
+/// described by its own name, or nothing.
+async fn list_through_operation(
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RelativePath,
+) -> Result<crate::fs::os::PathListingResult, StateError> {
+    use crate::fs::os::EntryListing;
+    use crate::fs::os::PathListingResult;
+
+    // The root is a directory the operation lists, and asking about it would be asking of what
+    // an instance holds before it holds anything.
+    let info = if path.is_empty() {
+        FileInfo::Directory
+    } else {
+        operation
+            .file_info(path)
+            .await
+            .forward_any::<StateError>("Failed to describe the path")?
+    };
+    match info {
+        FileInfo::NotExist => Ok(PathListingResult::NotFound),
+        FileInfo::Directory => {
+            let mut entries = operation
+                .read_directory(path)
+                .await
+                .forward_any::<StateError>("Failed to list the directory")?;
+            let mut items = Vec::new();
+            while let Some(entry) = entries.next().await {
+                let entry = entry.forward_any::<StateError>("Unusable directory entry")?;
+                items.push(FileListItem {
+                    name: entry.name,
+                    info: entry.info,
+                    name_hash: entry.name_hash,
+                });
+            }
+            Ok(PathListingResult::Directory {
+                listing: EntryListing::Items(items.into_iter()),
+            })
+        }
+        FileInfo::File { .. } => {
+            let name = path.name().to_string();
+            Ok(PathListingResult::File {
+                item: FileListItem {
+                    name_hash: crate::hash::hash_string(&name),
+                    name,
+                    info,
+                },
+            })
+        }
+    }
+}
+
+/// Whether the directory `name` in `parent`, which `probe` places on disk, is the root of a
+/// repository of its own. An `operation` that answers for the tree is asked about the path rather
+/// than the file system, as one outside the tree it tracks, which is what a nested repository's
+/// directory is.
+async fn nested_repository_root(
+    operation: &InstanceOperationImpl,
+    parent: &RelativePath,
+    probe: &mut std::path::PathBuf,
+    name: &str,
+) -> bool {
+    if operation.lists_through_operation() {
+        let marker = parent.join(name).join(crate::repository::DOT_LORE);
+        return operation
+            .untracked_file_info(&marker)
+            .await
+            .is_ok_and(|info| info.is_dir());
+    }
+    is_nested_repository_root(probe, name).await
+}
+
 async fn diff_filesystem_subtree_impl(
     mut ctx: FilesystemDiffContext,
     changes: &ChangeSender,
@@ -323,6 +413,8 @@ async fn diff_filesystem_subtree_impl(
             NamedRoot::Missing(states) => {
                 return diff_filesystem_missing(
                     ctx.from,
+                    ctx.current.node.is_valid_node_id(),
+                    ctx.discards.clone(),
                     ctx.filesystem_path,
                     states,
                     ctx.filter_mode,
@@ -341,9 +433,7 @@ async fn diff_filesystem_subtree_impl(
             NamedRoot::Excluded => return Ok(FilesystemDiffStats::default()),
         }
     } else {
-        crate::fs::os::list_path(absolute_path)
-            .await
-            .forward::<StateError>("Failed to list the path")?
+        list_walk_path(&ctx, absolute_path).await?
     };
 
     match listing {
@@ -396,6 +486,8 @@ async fn diff_filesystem_subtree_impl(
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
+                ctx.current.node.is_valid_node_id(),
+                ctx.discards.clone(),
                 ctx.filesystem_path,
                 ctx.states,
                 ctx.filter_mode,
@@ -404,6 +496,23 @@ async fn diff_filesystem_subtree_impl(
                 &ctx.link_mounts,
             )
             .await
+        }
+        crate::fs::os::PathListingResult::Unlistable => {
+            let path = ctx.filesystem_path.clone();
+            let stats = diff_filesystem_missing(
+                ctx.from,
+                ctx.current.node.is_valid_node_id(),
+                ctx.discards.clone(),
+                ctx.filesystem_path,
+                ctx.states,
+                ctx.filter_mode,
+                ctx.intent,
+                changes,
+                &ctx.link_mounts,
+            )
+            .await?;
+            stats.record_unreadable(path);
+            Ok(stats)
         }
     }
 }
@@ -470,6 +579,9 @@ async fn compare_single_file_against_state(
         )
         .await?;
         stats.classify(&modification);
+        if matches!(modification, FileModification::Unreadable) {
+            stats.record_unreadable(file_path.to_path());
+        }
 
         if modification.is_modified() {
             return Ok(SingleFileCompareResult::Modified);
@@ -769,6 +881,7 @@ async fn record_observed_size(
 /// the caller's walk recursion surfaces the children. Used to report a dirty-add
 /// directory exactly once per scan (unlike `add_change`, which walks the whole
 /// hierarchy for a directory add and would double-count against the recursion).
+/// A marking walk leaves a dirty move's mark on the node, as [`emit_unstaged_add`] leaves a file's.
 async fn emit_dirty_add_node_single(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -782,7 +895,7 @@ async fn emit_dirty_add_node_single(
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    if intent.stage().is_some() || !node.is_dirty_add() {
+    if intent.stage().is_some() || (!node.is_dirty_add() && !node.is_dirty_move()) {
         mark_settled(&state, &repository, node_id, SettledAction::Add, intent).await?;
     }
     emit_add_node_single(repository, state, node_id, path, changes, stats).await
@@ -1033,59 +1146,60 @@ async fn handle_single_file_compare_result(
     Ok(INVALID_NODE)
 }
 
+/// A staging walk includes the children staged for delete, so a path the file system
+/// still holds takes its delete back rather than being added a second time beside it.
+async fn collect_node_list(
+    traversal: &NodeMapping,
+    include_deleted: bool,
+) -> Result<StateChildrenNodes, StateError> {
+    let NodeMapping {
+        repository,
+        state,
+        node: node_id,
+        ..
+    } = traversal;
+    Ok(if node_id.is_valid_or_root_node_id() {
+        let node = state.node(repository.clone(), *node_id).await?;
+        if node.is_directory() {
+            state
+                .collect_children_unsorted(
+                    repository.clone(),
+                    *node_id,
+                    include_deleted,
+                    true, /* Traverse links */
+                )
+                .await?
+        } else {
+            // State has a file where filesystem has directory - treat as delete + add
+            // Return state node as single item for delete comparison
+            StateChildrenNodes {
+                repository: repository.clone(),
+                state: state.clone(),
+                children: vec![StateNamedNode::new(
+                    *node_id,
+                    0,
+                    node.name_hash,
+                    NodeFlags::from_bits_retain(node.flags),
+                )],
+            }
+        }
+    } else {
+        StateChildrenNodes {
+            repository: repository.clone(),
+            state: state.clone(),
+            children: vec![],
+        }
+    })
+}
+
 /// Handle diff for a directory path.
 /// All items from the listing are children of `node_path`.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory(
     ctx: FilesystemDiffContext,
-    file_listing: lore_io::DirStream,
+    file_listing: crate::fs::os::EntryListing,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
-    /// A staging walk includes the children staged for delete, so a path the file system
-    /// still holds takes its delete back rather than being added a second time beside it.
-    async fn collect_node_list(
-        traversal: &NodeMapping,
-        include_deleted: bool,
-    ) -> Result<StateChildrenNodes, StateError> {
-        let NodeMapping {
-            repository,
-            state,
-            node: node_id,
-            ..
-        } = traversal;
-        Ok(if node_id.is_valid_or_root_node_id() {
-            let node = state.node(repository.clone(), *node_id).await?;
-            if node.is_directory() {
-                state
-                    .collect_children_unsorted(
-                        repository.clone(),
-                        *node_id,
-                        include_deleted,
-                        true, /* Traverse links */
-                    )
-                    .await?
-            } else {
-                // State has a file where filesystem has directory - treat as delete + add
-                // Return state node as single item for delete comparison
-                StateChildrenNodes {
-                    repository: repository.clone(),
-                    state: state.clone(),
-                    children: vec![StateNamedNode::new(
-                        *node_id,
-                        0,
-                        node.name_hash,
-                        NodeFlags::from_bits_retain(node.flags),
-                    )],
-                }
-            }
-        } else {
-            StateChildrenNodes {
-                repository: repository.clone(),
-                state: state.clone(),
-                children: vec![],
-            }
-        })
-    }
     // Collect state node lists (always directory mode here)
     let staging = ctx.intent.stage().is_some();
     let mut node_list = collect_node_list(&ctx.from, staging).await?;
@@ -1201,18 +1315,14 @@ async fn flush_pending_dir_deletes(
 /// changes for only the portion that was actually materialized on disk under the
 /// active filter, returning whether anything materialized.
 ///
-/// Materialization mirrors clone/checkout discovery: excluded children are
-/// pruned (never written), a non-excluded file or link materializes, and a
-/// directory materializes when a descendant does or — when it has no children —
-/// when the empty directory itself is not excluded.
+/// Materialization follows the view's directory rule: excluded children are pruned (never
+/// written), a non-excluded file or link materializes, and a directory materializes where the
+/// view keeps it ([`FilterStates::creates_directory`]) or a descendant materializes.
 ///
-/// A directory can evaluate as "not excluded" only because the filter let the
-/// diff descend through it (a view re-inclusion's generated traversal rules, or a
-/// glob matching the directory but not content deeper inside it) while nothing
-/// under it is in view. Such a directory is never written, so its delete record
-/// is buffered in `pending` and emitted only once a materializing descendant
-/// proves it existed on disk; if none does, the buffered entry is dropped. This
-/// keeps the report from claiming a delete for a directory that was never there.
+/// Any other directory stands on disk only for what materializes below it, so its delete record
+/// is buffered in `pending` and emitted only once a materializing descendant proves it existed on
+/// disk; if none does, the buffered entry is dropped. This keeps the report from claiming a delete
+/// for a directory that was never there.
 ///
 /// When the intent marks dirty, every node a delete is emitted for — the
 /// materializing leaf and each flushed ancestor directory — is marked
@@ -1240,6 +1350,7 @@ async fn emit_filesystem_subtree_deletes(
     link_mounts: &[LinkMountInfo],
 ) -> Result<bool, StateError> {
     if intent.stage().is_some() {
+        let links_registered = state.registers_link();
         return Box::pin(stage_absent_subtree(
             state,
             repository,
@@ -1251,9 +1362,10 @@ async fn emit_filesystem_subtree_deletes(
             intent,
             changes,
             link_mounts,
+            links_registered,
         ))
         .await
-        .map(|kept| !kept);
+        .map(|absence| absence == Absence::Deleted);
     }
 
     // Caller guarantees `node` is not filter-excluded.
@@ -1278,10 +1390,8 @@ async fn emit_filesystem_subtree_deletes(
 
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
-    let mut had_child = false;
     let mut any_materialized = false;
     while let Some((child_id, child_node, child_name)) = children.next().await? {
-        had_child = true;
         let child_path = path.push_into_buf(&child_name).freeze();
         // Release the block read lock before recursing (see NodeNameLock docs).
         drop(child_name);
@@ -1318,10 +1428,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !had_child && !states.excluded(filter_mode) {
-        // Empty in-view directory: clone/checkout writes it, so its absence is a
-        // real deletion. It is the materializing leaf here, and its own buffered
-        // entry (pushed above) is flushed and marked along with its ancestors.
+    if !states.excluded(filter_mode) && states.creates_directory() {
         flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         return Ok(true);
     }
@@ -1334,12 +1441,19 @@ async fn emit_filesystem_subtree_deletes(
 }
 
 /// Settle the deletion of the absent subtree at `node` for a staging walk, as `stage` stages an
-/// absent directory, answering whether part of it is kept.
+/// absent node ([`Absence`]), answering what it made of the node.
 ///
-/// A child the filter excludes stays, with every directory on its path: the working tree lacks it
-/// because the filter left it out, not because it was deleted. A link stays too, and so does a
-/// directory the filter excludes that holds no children, which nothing materializes. Each node
-/// deleted is marked and reported once its children are settled.
+/// A link stays while its mount is absent, and so does every directory on its path. A node the view
+/// excludes is not on disk, so its absence alone deletes nothing. A directory the working tree
+/// held, one the view keeps ([`FilterStates::creates_directory`]) or one holding a node it held, is
+/// deleted with everything below it, what the view excludes included, which committing drops with
+/// it, and one the view keeps and hides everything below ([`Filter::view_hides_below`]) is deleted
+/// at once, without a walk of what it holds. Where
+/// `keeps_partial`, as in a tree that registers a link, and in a directory that may hold a pending
+/// merge's change ([`holds_pending_merge_change`]), a directory stays wherever staging keeps or
+/// leaves out a node below it, as [`AbsentChildren`] says, or a link of `link_mounts` lies below
+/// it, and so does an empty directory the filter excludes. Each node deleted is marked and reported
+/// once its children are settled.
 #[allow(clippy::too_many_arguments)]
 async fn stage_absent_subtree(
     state: Arc<State>,
@@ -1352,49 +1466,99 @@ async fn stage_absent_subtree(
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
     link_mounts: &[LinkMountInfo],
-) -> Result<bool, StateError> {
+    keeps_partial: bool,
+) -> Result<Absence, StateError> {
     if keeps_absent_link(node, path) {
-        return Ok(true);
+        return Ok(Absence::Kept);
     }
-    if node.is_directory() {
-        let mut kept = LinkMountInfo::any_under(link_mounts, path);
-        let mut had_child = false;
-        let mut children =
-            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
-                .await?;
-        while let Some((child_id, child_node, child_name)) = children.next().await? {
-            had_child = true;
-            let child_path = path.push_into_buf(&child_name).freeze();
-            // Release the block read lock before recursing (see NodeNameLock docs).
-            drop(child_name);
-            let (child_states, excluded) = repository.filter.child_excludes_tree(
-                states,
-                &child_path,
-                !child_node.is_file(),
-                filter_mode,
-            );
-            kept |= excluded
-                || Box::pin(stage_absent_subtree(
-                    state.clone(),
-                    repository.clone(),
-                    child_id,
-                    &child_node,
-                    &child_path,
-                    child_states,
-                    filter_mode,
-                    intent,
-                    changes,
-                    link_mounts,
-                ))
-                .await?;
-        }
-        if kept || (!had_child && states.excluded(filter_mode)) {
-            return Ok(true);
+    let keeps_partial = keeps_partial
+        || holds_pending_merge_change(&state, NodeFlags::from_bits_retain(node.flags));
+    if node.is_directory()
+        && (keeps_partial
+            || !states.creates_directory()
+            || !repository.filter.view_hides_below(states, path))
+    {
+        match stage_absent_children(
+            &state,
+            &repository,
+            node_id,
+            path,
+            states,
+            filter_mode,
+            intent,
+            changes,
+            link_mounts,
+            keeps_partial,
+        )
+        .await?
+        {
+            Absence::Deleted => {}
+            absence => return Ok(absence),
         }
     }
     mark_settled(&state, &repository, node_id, SettledAction::Delete, intent).await?;
     emit_single_delete(state, repository, node_id, path, changes).await?;
-    Ok(false)
+    Ok(Absence::Deleted)
+}
+
+/// Settles the children of the absent directory `node_id` as [`stage_absent_subtree`] does, and
+/// answers what it makes of the directory ([`AbsentChildren::settle`]).
+#[allow(clippy::too_many_arguments)]
+async fn stage_absent_children(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    path: &RelativePath,
+    states: FilterStates,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    changes: &ChangeSender,
+    link_mounts: &[LinkMountInfo],
+    keeps_partial: bool,
+) -> Result<Absence, StateError> {
+    let mut settled = AbsentChildren::of(
+        keeps_partial,
+        keeps_partial && LinkMountInfo::any_under(link_mounts, path),
+    );
+    let mut had_child = false;
+    let mut children =
+        StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
+    while let Some((child_id, child_node, child_name)) = children.next().await? {
+        had_child = true;
+        let child_path = path.push_into_buf(&child_name).freeze();
+        // Release the block read lock before recursing (see NodeNameLock docs).
+        drop(child_name);
+        let (child_states, excluded) = repository.filter.child_excludes_tree(
+            states,
+            &child_path,
+            !child_node.is_file(),
+            filter_mode,
+        );
+        if excluded {
+            settled.add(Absence::NeverHeld);
+            continue;
+        }
+        settled.add(
+            Box::pin(stage_absent_subtree(
+                state.clone(),
+                repository.clone(),
+                child_id,
+                &child_node,
+                &child_path,
+                child_states,
+                filter_mode,
+                intent,
+                changes,
+                link_mounts,
+                keeps_partial,
+            ))
+            .await?,
+        );
+    }
+    if keeps_partial && !had_child && states.excluded(filter_mode) {
+        return Ok(Absence::NeverHeld);
+    }
+    Ok(settled.settle(states.creates_directory()))
 }
 
 /// Whether staging leaves the name alone: a scratch file of the client's own making, or the
@@ -1412,11 +1576,12 @@ fn staging_ignores_name(name: &str) -> bool {
 /// The index in `node_list` of the child an entry named `name_hash` claims, `None` where the
 /// directory holds none.
 ///
-/// Two children can share a folded name: a staged replacement sits beside the node it
-/// displaced, and two spellings of one name can both be committed. A staging walk claims one
-/// child per entry and prefers one not staged for delete, so a replacement is not replaced
-/// again; only a run of more than one child is read to decide. Every other intent reports
-/// against whichever the search reached, as it has.
+/// Two children can share a folded name: a replacement sits beside the node it displaced, marked
+/// deleted, staged or dirty, and two spellings of one name can both be committed. From a run of
+/// more than one child, every walk takes the first not yet claimed and not marked deleted, so an
+/// entry pairs with the live node and a replacement is not replaced again, or else the first not
+/// yet claimed; only such a run is read. A staging walk claims one child per entry; every other
+/// walk takes the child the search reached where the run is one child or each of it is claimed.
 async fn claim_named_child(
     node_list: &StateChildrenNodes,
     claimed: &[bool],
@@ -1427,9 +1592,6 @@ async fn claim_named_child(
     let Ok(found) = children.binary_search_by(|child| child.name.cmp(&name_hash)) else {
         return Ok(None);
     };
-    if !staging {
-        return Ok(Some(found));
-    }
 
     let mut start = found;
     while start > 0 && children[start - 1].name == name_hash {
@@ -1440,7 +1602,7 @@ async fn claim_named_child(
         end += 1;
     }
     if end - start == 1 {
-        return Ok((!claimed[start]).then_some(start));
+        return Ok((!staging || !claimed[start]).then_some(start));
     }
 
     let mut displaced = None;
@@ -1452,17 +1614,17 @@ async fn claim_named_child(
             .state
             .node(node_list.repository.clone(), children[index].node)
             .await?;
-        if !node.is_staged_delete() {
+        if !node.is_deleted() {
             return Ok(Some(index));
         }
         displaced = displaced.or(Some(index));
     }
-    Ok(displaced)
+    Ok(displaced.or((!staging).then_some(found)))
 }
 
 /// Whether the tree and the file system agree on the type at a path. A type change replaces
 /// the node rather than settling it, so staging decides only where they agree.
-fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
+pub(crate) fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
     (from_node.is_file() && is_file)
         || ((from_node.is_directory() || from_node.is_link()) && is_directory)
 }
@@ -1511,6 +1673,42 @@ async fn staged_entry(
     Ok(StagedEntry::Compare { insisted: insists })
 }
 
+/// Whether the walk passes over `entry` without comparing it, recording in `stats` an entry it
+/// cannot read that the filter keeps: what it holds is unknown, so a caller about to remove the
+/// directory has to hear of it.
+fn passes_over(
+    ctx: &FilesystemDiffContext,
+    entry: &std::io::Result<lore_io::DirEntry>,
+    stats: &FilesystemDiffStats,
+) -> bool {
+    let Ok(found) = entry else {
+        stats.record_unreadable(ctx.filesystem_path.clone());
+        return true;
+    };
+    match &found.metadata {
+        _ if found.is_symlink => return true,
+        Some(metadata) => return metadata.kind == lore_io::StatKind::Other,
+        None => {}
+    }
+    let Ok(name) = crate::fs::os::entry_name(found.file_name.clone()) else {
+        stats.record_unreadable(ctx.filesystem_path.clone());
+        return true;
+    };
+    if is_reserved_node_name(name.as_str()) {
+        return true;
+    }
+    let path = ctx.filesystem_path.join(name.as_str());
+    let (_, excluded) =
+        ctx.from
+            .repository
+            .filter
+            .child_excludes_tree(ctx.states, &path, false, ctx.filter_mode);
+    if !excluded {
+        stats.record_unreadable(path);
+    }
+    true
+}
+
 /// Match each filesystem item from `file_receiver` against `node_list` (the
 /// `from` state's children) and `current_node_list` (the `current` state's
 /// children), emitting changes through `changes`, marking matched entries in
@@ -1534,7 +1732,7 @@ async fn staged_entry(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &FilesystemDiffContext,
-    mut file_listing: lore_io::DirStream,
+    mut file_listing: crate::fs::os::EntryListing,
     node_list: &StateChildrenNodes,
     current_node_list: &StateChildrenNodes,
     node_list_found: &mut [bool],
@@ -1551,10 +1749,11 @@ async fn diff_filesystem_directory_walk(
     let mut entry_buffer = ctx
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
-    while let Some(entry) = file_listing.next().await {
-        let Some(item) = crate::fs::os::file_list_item(entry)
-            .forward::<StateError>("Unusable directory entry")?
-        else {
+    while let Some(item) = file_listing
+        .next_unless(|entry| passes_over(ctx, entry, stats))
+        .await
+    {
+        let Some(item) = item.forward::<StateError>("Unusable directory entry")? else {
             continue;
         };
         if is_reserved_node_name(item.name.as_str()) {
@@ -1571,14 +1770,14 @@ async fn diff_filesystem_directory_walk(
         // out. An entry the filter drops is left unclaimed, as before.
         let claimed =
             claim_named_child(node_list, node_list_found, item.name_hash, staging).await?;
-        let is_directory = item.metadata.kind == StatKind::Directory;
+        let is_directory = item.info.is_dir();
         let filter = &ctx.from.repository.filter;
-        let mode = filter
-            .tracked_mode(
+        let (item_states, reason) = filter
+            .child_tracked_reason(
                 ctx.states,
                 entry.path(),
                 is_directory,
-                ctx.filter_mode | FilterMode::KeepTracked,
+                (ctx.filter_mode | FilterMode::KeepTracked).at(claimed.is_some()),
                 async || match claimed {
                     Some(index) => {
                         let named = &node_list.children[index];
@@ -1596,9 +1795,7 @@ async fn diff_filesystem_directory_walk(
                 },
             )
             .await?;
-        let (item_states, excluded) =
-            filter.child_emit_excludes(ctx.states, entry.path(), is_directory, mode);
-        if excluded {
+        if Filter::emit(entry.path(), reason) {
             continue;
         }
 
@@ -1651,8 +1848,8 @@ async fn diff_filesystem_directory_walk(
         let was_directory = from_node.is_directory();
         let was_link = from_node.is_link();
 
-        let is_directory = item.metadata.kind == StatKind::Directory;
-        let is_file = item.metadata.kind == StatKind::File;
+        let is_directory = item.info.is_dir();
+        let is_file = item.info.is_file();
 
         let is_rename = from_match.renamed();
 
@@ -1693,14 +1890,20 @@ async fn diff_filesystem_directory_walk(
             // add — the file's presence on disk is the add. Comparing the
             // filesystem hash against the staged node's zero address would
             // misclassify, so emit Add+Dirty directly and skip the compare.
-            if ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id() {
+            // A node `lore dirty move` moved onto a name state_current holds
+            // by another node, its move not staged, is a dirty-move
+            // destination all the same.
+            let moved_here = from_node.is_dirty_move()
+                && !from_node.is_staged()
+                && current_node_id != from_named_node.node;
+            if ctx.intent.marks_dirty() && (!current_node_id.is_valid_node_id() || moved_here) {
                 emit_unstaged_add(
                     node_list.repository.clone(),
                     node_list.state.clone(),
                     from_named_node.node,
                     from_node,
                     &entry.to_path(),
-                    &FileInfo::from_stat(&item.metadata),
+                    &item.info,
                     changes,
                     stats,
                     ctx.filter_mode,
@@ -1717,7 +1920,7 @@ async fn diff_filesystem_directory_walk(
                 None
             };
 
-            let observed = FileInfo::from_stat(&item.metadata);
+            let observed = item.info;
             let compare_result = compare_single_file_against_state(
                 &ctx.operation,
                 node_list.repository.clone(),
@@ -1848,6 +2051,61 @@ async fn diff_filesystem_directory_walk(
     Ok(())
 }
 
+/// Reports one entry `ctx.from`'s directory holds no node for, walking below it where it is a
+/// directory, as the walk of the directory would report it among its new entries.
+///
+/// `ctx` stands at the directory holding the entry, which has to be a node of `ctx.from`.
+pub(crate) async fn diff_filesystem_new_entry(
+    ctx: &FilesystemDiffContext,
+    item: FileListItem,
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
+    let staging = ctx.intent.stage().is_some();
+    let mut stats = FilesystemDiffStats::default();
+    if is_reserved_node_name(item.name.as_str())
+        || (staging && staging_ignores_name(item.name.as_str()))
+    {
+        return Ok(stats);
+    }
+
+    let child_path = ctx
+        .filesystem_path
+        .push_into_buf(item.name.as_str())
+        .freeze();
+    let (child_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
+        ctx.states,
+        &child_path,
+        item.info.is_dir(),
+        ctx.filter_mode,
+    );
+    if excluded {
+        return Ok(stats);
+    }
+    let mut current_node_list = collect_node_list(&ctx.current, false).await?;
+    named_node_sort(&mut current_node_list.children);
+
+    let repository_root = ctx.from.repository.require_path()?;
+    let mut nested_probe = None;
+    let mut tasks = JoinSet::new();
+    let mut new_file_list = [(item, child_states)];
+    let work_result = diff_filesystem_new_entries(
+        ctx,
+        &mut new_file_list,
+        &current_node_list,
+        &mut nested_probe,
+        repository_root,
+        staging,
+        &mut tasks,
+        changes,
+        &mut stats,
+    )
+    .await;
+    let drain_result = lore_drain_tasks!(tasks, StateError::internal("Task failure"));
+    work_result?;
+    drain_result?;
+    Ok(stats)
+}
+
 /// Walks a directory the tree holds as a link, against the linked state, for
 /// [`diff_filesystem_directory_walk`].
 #[allow(clippy::too_many_arguments)]
@@ -1903,12 +2161,7 @@ async fn diff_filesystem_linked_directory(
         current_link.as_ref(),
     )
     .await?;
-    let from_item_states = ctx
-        .from
-        .repository
-        .filter
-        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-        .0;
+    let from_item_states = from_directory_states(ctx, &from_path, &item_path, item_states);
     // The mounts are spelled from the from-side path the walk below compares against.
     let linked_mounts =
         crate::state::collect_crossed_mounts(&from, from.node, &current, current.node, &from_path)
@@ -1952,7 +2205,7 @@ async fn diff_filesystem_linked_directory(
 /// parent's listing.
 async fn diff_named_type_change(
     mut ctx: FilesystemDiffContext,
-    listing: lore_io::DirStream,
+    listing: crate::fs::os::EntryListing,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     let mut parent = ctx
@@ -1961,18 +2214,32 @@ async fn diff_named_type_change(
         .to_absolute_path(ctx.from.repository.require_path()?)
         .forward::<StateError>("placing the named directory below the root")?;
     let name = ctx.filesystem_path.name();
-    parent.push(name);
-    let stat = lore_io::IoDriver::global()
-        .symlink_stat(parent.as_path())
-        .await
-        .map_err(crate::fs::filesystem_provider::FsError::from)
-        .forward::<StateError>("reading the named directory")?;
-    parent.pop();
-    // The listing follows a symbolic link at the path, which the walk over its parent skips,
-    // leaving the file missing.
-    if stat.kind != StatKind::Directory {
+    let observed = if ctx.operation.lists_through_operation() {
+        ctx.operation
+            .file_info(&ctx.filesystem_path)
+            .await
+            .forward_any::<StateError>("reading the named directory")?
+    } else {
+        parent.push(name);
+        let stat = lore_io::IoDriver::global()
+            .symlink_stat(parent.as_path())
+            .await
+            .map_err(crate::fs::filesystem_provider::FsError::from)
+            .forward::<StateError>("reading the named directory")?;
+        parent.pop();
+        // The listing follows a symbolic link at the path, which the walk over its parent skips.
+        if stat.kind == lore_io::StatKind::Directory {
+            FileInfo::from_stat(&stat)
+        } else {
+            FileInfo::NotExist
+        }
+    };
+    // What is not a directory at the path leaves the file missing.
+    if !observed.is_dir() {
         return diff_filesystem_missing(
             ctx.from,
+            ctx.current.node.is_valid_node_id(),
+            ctx.discards.clone(),
             ctx.filesystem_path,
             ctx.states,
             ctx.filter_mode,
@@ -1996,7 +2263,7 @@ async fn diff_named_type_change(
             parent_node_id: Some(file.parent),
             intent: ctx.intent,
             states: ctx.states,
-            observed: FileInfo::from_stat(&stat),
+            observed,
             insists: false,
         },
         &ctx.filesystem_path,
@@ -2005,7 +2272,16 @@ async fn diff_named_type_change(
         ctx.filter_mode,
     )
     .await?;
-    if !descends_into_replacement(replacement, ctx.intent, &mut parent, name).await {
+    if !descends_into_replacement(
+        replacement,
+        ctx.intent,
+        &ctx.operation,
+        &ctx.filesystem_path.parent_path(),
+        &mut parent,
+        name,
+    )
+    .await
+    {
         return Ok(FilesystemDiffStats::default());
     }
     ctx.from.node = replacement;
@@ -2018,8 +2294,8 @@ async fn diff_named_type_change(
     diff_filesystem_directory(ctx, listing, changes).await
 }
 
-/// Whether a walk descends into the directory `name` below `parent` that replaced a file,
-/// against `replacement`, the node the intent minted for it.
+/// Whether a walk descends into the directory `name` below `parent`, which `probe` places on disk,
+/// that replaced a file, against `replacement`, the node the intent minted for it.
 ///
 /// A walk that only reports mints no node and walks the directory against an empty listing, so
 /// its content is reported as added and a reversed diff deletes it before the directory itself,
@@ -2030,7 +2306,9 @@ async fn diff_named_type_change(
 async fn descends_into_replacement(
     replacement: NodeID,
     intent: FilesystemDiffIntent,
-    parent: &mut std::path::PathBuf,
+    operation: &InstanceOperationImpl,
+    parent: &RelativePath,
+    probe: &mut std::path::PathBuf,
     name: &str,
 ) -> bool {
     if replacement.is_valid_node_id() {
@@ -2039,11 +2317,31 @@ async fn descends_into_replacement(
     if intent.marks_dirty() {
         return false;
     }
-    let nested = is_nested_repository_root(parent, name).await;
+    let nested = nested_repository_root(operation, parent, probe, name).await;
     if nested {
         lore_trace!("Not descending into nested repository root {name} that replaced a file");
     }
     !nested
+}
+
+/// The states below the `from` side's directory `from_path`, matched to the working tree's
+/// directory at `item_path`, whose step handed back `item_states`: those same states where both
+/// sides stand at one path below one parent verdict.
+fn from_directory_states(
+    ctx: &FilesystemDiffContext,
+    from_path: &RelativePath,
+    item_path: &RelativePath,
+    item_states: FilterStates,
+) -> FilterStates {
+    if ctx.from_states == ctx.states && from_path.as_lowercase_str() == item_path.as_lowercase_str()
+    {
+        return item_states;
+    }
+    ctx.from
+        .repository
+        .filter
+        .child_excludes_tree(ctx.from_states, from_path, true, ctx.filter_mode)
+        .0
 }
 
 /// Settles a directory both the tree and the file system hold and walks below it, for
@@ -2087,7 +2385,14 @@ async fn diff_filesystem_matched_directory(
             .filesystem_path
             .to_absolute_path_cached(repository_root, nested_probe)
             .forward::<StateError>("placing the walked directory below the root")?;
-        if is_nested_repository_root(probe, item.name.as_str()).await {
+        if nested_repository_root(
+            &ctx.operation,
+            &ctx.filesystem_path,
+            probe,
+            item.name.as_str(),
+        )
+        .await
+        {
             lore_trace!("Discarding zombie entry for nested repository root {item_path}");
             return Ok(false);
         }
@@ -2164,19 +2469,14 @@ async fn diff_filesystem_matched_directory(
             from_named_node.node,
             &from_node,
             &item_path,
-            FileInfo::from_stat(&item.metadata),
+            item.info,
             changes,
             ctx.intent,
             ctx.filter_mode,
         )
         .await?;
     }
-    let from_item_states = ctx
-        .from
-        .repository
-        .filter
-        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-        .0;
+    let from_item_states = from_directory_states(ctx, &from_path, &item_path, item_states);
     let current_link = current_node.is_link().then(|| current_node.linked_node());
     let (from, current) = crate::state::cross_links(
         DiffSide {
@@ -2267,7 +2567,7 @@ async fn diff_filesystem_type_change(
         parent_node_id: Some(ctx.from.node),
         intent: ctx.intent,
         states: item_states,
-        observed: FileInfo::from_stat(&item.metadata),
+        observed: item.info,
         insists: false,
     };
 
@@ -2303,7 +2603,15 @@ async fn diff_filesystem_type_change(
             .filesystem_path
             .to_absolute_path_cached(repository_root, nested_probe)
             .forward::<StateError>("placing the walked directory below the root")?;
-        descends_into_replacement(replacement, ctx.intent, probe, item.name.as_str()).await
+        descends_into_replacement(
+            replacement,
+            ctx.intent,
+            &ctx.operation,
+            &ctx.filesystem_path,
+            probe,
+            item.name.as_str(),
+        )
+        .await
     };
     if descends {
         let item_path = entry.to_path();
@@ -2575,11 +2883,7 @@ async fn tracked_child(
         .state
         .node(current_node_list.repository.clone(), node_id)
         .await?;
-    let agrees = types_agree(
-        &node,
-        item.metadata.kind == StatKind::File,
-        item.metadata.kind == StatKind::Directory,
-    );
+    let agrees = types_agree(&node, item.info.is_file(), item.info.is_dir());
     Ok(if agrees { node_id } else { INVALID_NODE })
 }
 
@@ -2630,6 +2934,129 @@ async fn spelled_as(
         .is_some_and(|held| *held == *name))
 }
 
+/// An entry of a directory of the working tree, as a listing of it reads it.
+#[lore_macro::test_pub]
+pub(crate) struct ListedEntry {
+    /// The fold of its name, which [`InstanceOperation::read_directory`] carries, and which a
+    /// node's children are matched on.
+    pub(crate) folded: u64,
+    pub(crate) name: String,
+    /// Whether it is a file, and otherwise a directory.
+    pub(crate) file: bool,
+    /// Whether a child of the directory stands for it.
+    pub(crate) claimed: bool,
+}
+
+impl ListedEntry {
+    pub(crate) fn listed(entry: DirectoryEntry) -> Self {
+        Self {
+            folded: entry.name_hash,
+            file: entry.info.is_file(),
+            name: entry.name,
+            claimed: false,
+        }
+    }
+}
+
+/// The entries a directory of the working tree holds, read once, which are paired with the
+/// children of the directory's node as the filesystem diff pairs them ([`tracked_child`]): a
+/// reset's walk pairs its children and purges what none claims, and a realize pairs the source of
+/// each move whose rename the file system refused.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct ListedSpellings {
+    /// Sorted by fold.
+    pub(crate) entries: Vec<ListedEntry>,
+    /// Whether the listing read every entry. A directory that cannot be listed, as one the
+    /// working tree does not hold, and an entry that cannot be read leave it short.
+    pub(crate) complete: bool,
+}
+
+impl ListedSpellings {
+    /// Lists `directory`, holding nothing where it cannot be listed and skipping an entry that
+    /// cannot be read, which leaves the listing short.
+    pub(crate) async fn read(operation: &InstanceOperationImpl, directory: &RelativePath) -> Self {
+        let mut listed = Self::default();
+        if let Ok(mut listing) = operation.read_directory(directory).await {
+            listed.complete = true;
+            while let Some(entry) = listing.next().await {
+                match entry {
+                    Ok(entry) => listed.entries.push(ListedEntry::listed(entry)),
+                    Err(_) => listed.complete = false,
+                }
+            }
+        }
+        listed.entries.sort_unstable_by_key(|entry| entry.folded);
+        listed
+    }
+
+    /// The entries folding to `folded`.
+    fn run(&self, folded: u64) -> std::ops::Range<usize> {
+        let start = self.entries.partition_point(|entry| entry.folded < folded);
+        let end = self.entries[start..]
+            .iter()
+            .position(|entry| entry.folded != folded)
+            .map_or(self.entries.len(), |after| start + after);
+        start..end
+    }
+
+    /// The other spelling the directory holds the child `node` in, which the revision names
+    /// `name`: the one entry folding to its name, where it is spelled otherwise and of the child's
+    /// kind ([`types_agree`]), as [`tracked_child`] pairs an entry with the only child of its
+    /// name. That entry is claimed, and so is one spelled as the child whatever its kind, which the
+    /// walk replaces.
+    pub(crate) fn claim(&mut self, name: &str, node: &Node) -> Option<String> {
+        let run = self.run(node.name_hash);
+        let entries = &mut self.entries[run];
+        if let Some(spelled) = entries.iter_mut().find(|entry| entry.name == name) {
+            spelled.claimed = true;
+            return None;
+        }
+        match entries {
+            [entry] if !entry.claimed && types_agree(node, entry.file, !entry.file) => {
+                entry.claimed = true;
+                Some(entry.name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Adds the entry `name`, folding to `folded`, a file where `file` says so, which a provider's
+    /// index answered for, where the listing holds no entry of that name yet.
+    pub(crate) fn add(&mut self, folded: u64, name: String, file: bool) {
+        let run = self.run(folded);
+        if self.entries[run.clone()]
+            .iter()
+            .any(|entry| entry.name == name)
+        {
+            return;
+        }
+        self.entries.insert(
+            run.start,
+            ListedEntry {
+                folded,
+                name,
+                file,
+                claimed: false,
+            },
+        );
+    }
+
+    /// Whether the one entry folding to `name` is spelled otherwise and claimed by no child, which
+    /// [`Self::claim`] then pairs with the child of that name where it is of the child's kind.
+    pub(crate) fn holds_another_spelling(&self, name: &str) -> bool {
+        let run = self.run(crate::hash::hash_string(name));
+        matches!(&self.entries[run], [entry] if !entry.claimed && entry.name != name)
+    }
+
+    /// Whether a child claimed the entry `name`, folding to `folded`.
+    pub(crate) fn claims(&self, name: &str, folded: u64) -> bool {
+        self.entries[self.run(folded)]
+            .iter()
+            .any(|entry| entry.claimed && entry.name == name)
+    }
+}
+
 /// Reports the entries no node matched, each with the filter's verdict for it, walking below new
 /// directories, for [`diff_filesystem_directory_walk`]. A
 /// [`FilesystemDiffIntent::ReportTracked`] walk leaves out each entry the current revision does
@@ -2676,7 +3103,7 @@ fn diff_filesystem_new_entries<'a>(
                 .push_into_buf(file.name.as_str())
                 .freeze();
 
-            let is_directory = file.metadata.kind == StatKind::Directory;
+            let is_directory = file.info.is_dir();
 
             if is_directory {
                 // A directory on disk with no `state_from` node that matches a
@@ -2766,7 +3193,14 @@ fn diff_filesystem_new_entries<'a>(
                     .filesystem_path
                     .to_absolute_path_cached(repository_root, nested_probe)
                     .forward::<StateError>("placing the walked directory below the root")?;
-                if is_nested_repository_root(probe, file.name.as_str()).await {
+                if nested_repository_root(
+                    &ctx.operation,
+                    &ctx.filesystem_path,
+                    probe,
+                    file.name.as_str(),
+                )
+                .await
+                {
                     lore_trace!("Skipping nested repository root {child_file_path}");
                     continue 'new_file_iter;
                 }
@@ -2880,7 +3314,7 @@ fn diff_filesystem_new_entries<'a>(
                 parent_node_id: Some(ctx.from.node),
                 intent: ctx.intent,
                 states: child_states,
-                observed: FileInfo::from_stat(&file.metadata),
+                observed: file.info,
                 insists: false,
             };
 
@@ -3060,13 +3494,13 @@ async fn diff_filesystem_single_file(
         None
     };
 
-    let observed = FileInfo::from_stat(&file_item.metadata);
+    let observed = file_item.info;
 
     // Staging decides on a node the tree holds before anything is compared, as the directory
     // walk does.
     let mut insisted = false;
     if let Some(stage) = ctx.intent.stage()
-        && file_item.metadata.kind == StatKind::File
+        && file_item.info.is_file()
         && let Some(node) = from_node
         && node.is_file()
     {
@@ -3101,7 +3535,7 @@ async fn diff_filesystem_single_file(
     // the file's presence on disk is the add. Skip the compare and emit
     // Add+Dirty directly.
     if ctx.intent.marks_dirty()
-        && file_item.metadata.kind == StatKind::File
+        && file_item.info.is_file()
         && ctx.from.node.is_valid_node_id()
         && !ctx.current.node.is_valid_node_id()
         && let Some(node) = from_node
@@ -3153,7 +3587,7 @@ async fn diff_filesystem_single_file(
         compare_result,
         &ctx.filesystem_path,
         None, // No rename detection for single file path
-        file_item.metadata.kind == StatKind::Directory,
+        file_item.info.is_dir(),
         changes,
         &stats,
         ctx.filter_mode,
@@ -3165,8 +3599,11 @@ async fn diff_filesystem_single_file(
 
 /// Handle diff when filesystem path doesn't exist.
 /// Everything in state under this path is considered deleted, bar what a link keeps.
+#[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_missing(
     from: NodeMapping,
+    in_current: bool,
+    discards: Option<Arc<WalkDiscards>>,
     filesystem_path: RelativePath,
     states: FilterStates,
     filter_mode: FilterMode,
@@ -3204,6 +3641,19 @@ async fn diff_filesystem_missing(
             return Ok(stats);
         }
 
+        // A file `from` holds that the revision does not, or a directory it holds as added, with
+        // nothing on disk, is an add the user reverted by removing it, which the walk of the
+        // directory above discards rather than reports deleted (`diff_filesystem_missing_nodes`).
+        // A walk of the path on its own, such as one a scan answered from the SWFS record makes,
+        // does the same.
+        if intent.marks_dirty()
+            && (from_node.is_file() || (from_node.is_directory() && from_node.is_added()))
+            && !in_current
+            && let Some(discards) = &discards
+        {
+            discards.queue(from.state.clone(), from.repository.clone(), vec![from.node]);
+            return Ok(stats);
+        }
         lore_trace!(
             "Filesystem path {} does not exist, marking state node {} as deleted",
             filesystem_path,
@@ -3296,4 +3746,40 @@ pub(crate) fn diff_os_filesystem(
         }
         Ok(stats)
     }
+}
+
+/// Reports the directory `ctx` stands at as added where `ctx.from` holds it and the revision it
+/// compares against does not, as the walk of the directory above reports such an entry.
+///
+/// A walk that starts at a directory reports what is in it and not the directory, so a caller
+/// walking the directory on its own, rather than as an entry of the one above, reports it here.
+pub(crate) async fn report_uncommitted_directory(
+    ctx: &FilesystemDiffContext,
+    changes: &ChangeSender,
+) -> Result<(), StateError> {
+    if ctx.filesystem_path.is_empty()
+        || !ctx.from.node.is_valid_node_id()
+        || ctx.current.node.is_valid_node_id()
+    {
+        return Ok(());
+    }
+    let block = ctx
+        .from
+        .state
+        .block(ctx.from.repository.clone(), NodeBlock::index(ctx.from.node))
+        .await?;
+    let node = block.node(Node::index(ctx.from.node));
+    if !node.is_directory() {
+        return Ok(());
+    }
+    emit_dirty_add_node_single(
+        ctx.from.repository.clone(),
+        ctx.from.state.clone(),
+        ctx.from.node,
+        &ctx.filesystem_path,
+        changes,
+        &FilesystemDiffStats::default(),
+        ctx.intent,
+    )
+    .await
 }

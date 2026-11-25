@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::runtime::processor_count;
@@ -29,6 +30,7 @@ use lore_revision::node::INVALID_NODE;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
+use lore_revision::node::NodeNameError;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::node::validate_node_name_for_store;
 use lore_revision::repository::RepositoryContext;
@@ -53,7 +55,16 @@ use crate::revision_tree::handle::SharedClaim;
 /// One node to add. The parent is `parent_node_id`, or the node created by an
 /// earlier entry when `parent_node_id` is the invalid-node sentinel.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeAddEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `ADD_COMPLETE`
     pub entry_id: u64,
@@ -76,7 +87,16 @@ pub struct LoreRevisionTreeAddEntry {
 
 /// Arguments for `lore_revision_tree_add`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(add_impl)]
 pub struct LoreRevisionTreeAddArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
@@ -90,6 +110,7 @@ pub struct LoreRevisionTreeAddArgs {
 #[error_set]
 enum AddError {
     InvalidArguments,
+    Oversized,
     SlowDown,
 }
 
@@ -107,6 +128,7 @@ impl EventError for AddError {
     fn translated(&self) -> LoreError {
         match self {
             AddError::InvalidArguments(_) => LoreError::InvalidArguments,
+            AddError::Oversized(_) => LoreError::Oversized,
             AddError::SlowDown(_) => LoreError::SlowDown,
             AddError::Internal(_) => LoreError::Internal,
         }
@@ -145,6 +167,7 @@ fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(AddError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(AddError::Oversized(_)) => LoreErrorCode::Oversized,
         Err(AddError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(AddError::Internal(_)) => LoreErrorCode::Internal,
     }
@@ -237,6 +260,22 @@ fn resolve_parent(parent: ParentRef, created: &[NodeID]) -> NodeID {
 fn reject(entry_id: u64, entry_index: usize, reason: &str) -> AddError {
     emit_add_error(entry_id, LoreErrorCode::InvalidArguments);
     AddError::invalid(format!("entry {entry_index}: {reason}"))
+}
+
+/// Reject the whole batch for an entry whose name the node name table refuses, as [`reject`]
+/// does: as `Oversized` where the name is over its length bound, the code a size bound fails
+/// with, and as an invalid argument otherwise.
+fn reject_name(entry_id: u64, entry_index: usize, error: NodeNameError) -> AddError {
+    match error {
+        NodeNameError::Oversized(oversized) => {
+            emit_add_error(entry_id, LoreErrorCode::Oversized);
+            let context = format!("entry {entry_index}: {}", oversized.context);
+            AddError::Oversized(
+                Oversized { context }.chain_err(oversized, "checking the entry's name"),
+            )
+        }
+        error => reject(entry_id, entry_index, &error.to_string()),
+    }
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the
@@ -483,7 +522,7 @@ async fn plan_entries(
             return Err(reject(entry_id, index, "name must not be empty"));
         }
         if let Err(error) = validate_node_name_for_store(name) {
-            return Err(reject(entry_id, index, &error.to_string()));
+            return Err(reject_name(entry_id, index, error));
         }
 
         let Some(flags) = node_flags_for_kind(entry.kind) else {
@@ -853,14 +892,25 @@ async fn apply_plan(
             .await;
         }
     }
-
+    let state: &State = claim.state();
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context, state, None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if applied < total {
         let failed = total - applied;
         return Err(failures
             .strongest
             .call_error(&format!("{failed}/{total} node adds failed")));
     }
-    Ok(())
+    drained.map_err(|error| {
+        AddError::internal_with_context(error, "stage the moves of directories the adds were in")
+    })
 }
 
 /// Add a batch of nodes to the tree.
@@ -925,12 +975,12 @@ async fn apply_plan(
 /// Concurrency across parents covers initializing and publishing a node, not
 /// allocating its slot: slot allocation is serialized per loaded tree, so a
 /// large batch allocates one node at a time however its parents are spread.
-pub async fn add(
+pub fn add(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, add_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, add_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

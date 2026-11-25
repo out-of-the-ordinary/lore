@@ -29,6 +29,7 @@ pub(crate) use lore_base::error::AlreadyLinked;
 pub(crate) use lore_base::error::BranchAdvanced;
 pub(crate) use lore_base::error::BranchAlreadyExists;
 pub(crate) use lore_base::error::BranchNotFound;
+pub(crate) use lore_base::error::Cancelled;
 pub(crate) use lore_base::error::Conflict;
 pub(crate) use lore_base::error::DeleteCurrent;
 pub(crate) use lore_base::error::DeleteDefault;
@@ -45,6 +46,7 @@ pub(crate) use lore_base::error::LayerNotFound;
 pub(crate) use lore_base::error::LinkDivergent;
 pub(crate) use lore_base::error::LinkNotFound;
 pub(crate) use lore_base::error::LinkPathNotFound;
+pub(crate) use lore_base::error::LinkPinsDiverge;
 pub(crate) use lore_base::error::LocalModifications;
 pub(crate) use lore_base::error::LockNotFound;
 pub(crate) use lore_base::error::LockNotOwned;
@@ -75,8 +77,10 @@ pub(crate) use lore_base::error::is_refusal;
 
 #[error_set]
 pub enum StateErrors {
+    Cancelled,
     NodeNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     NotFound,
     RevisionNotFound,
     WriteRequired,

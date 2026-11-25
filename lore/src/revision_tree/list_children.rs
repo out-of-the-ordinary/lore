@@ -37,7 +37,17 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_list_children`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(list_children_impl)]
 pub struct LoreRevisionTreeListChildrenArgs {
     /// Per-call correlation id echoed back in events
@@ -185,12 +195,12 @@ async fn resolve_listing_target(
 /// failure is therefore not attributable to this call on a multiplexed
 /// transport; callers treat a non-zero `Complete` after a successful header as
 /// "the listing was truncated".
-pub async fn list_children(
+pub fn list_children(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeListChildrenArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_children_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_children_impl)
 }
 
 async fn list_children_impl(

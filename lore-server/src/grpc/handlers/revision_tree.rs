@@ -18,6 +18,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -57,48 +58,40 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        can_read,
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            tree(
-                repository.clone(),
-                revision,
-                path,
-                max_depth,
-                can_read,
-                false,
-            )
-            .await
-            .filter_slow_down()?
-            .map(|result| {
-                debug!("Got tree");
-                Response::new(RevisionTreeResponse {
-                    paths: result
-                        .paths
-                        .iter()
-                        .map(|tree_path| Path {
-                            address: tree_path
-                                .address
-                                .map(|address| address.into())
-                                .unwrap_or_default(),
-                            path: tree_path.path.to_string(),
-                            r#type: super::path_diff::node_flags_to_type(tree_path.flags),
-                            tracking: tree_path.tracking,
-                        })
-                        .collect(),
+            tree(repository.clone(), revision, path, max_depth, false)
+                .await
+                .filter_slow_down()?
+                .filter_cancelled()?
+                .map(|result| {
+                    debug!("Got tree");
+                    Response::new(RevisionTreeResponse {
+                        paths: result
+                            .paths
+                            .iter()
+                            .map(|tree_path| Path {
+                                address: tree_path.address.map_or_default(|address| address.into()),
+                                path: tree_path.path.to_string(),
+                                r#type: super::path_diff::node_flags_to_type(tree_path.flags),
+                                tracking: tree_path.tracking,
+                            })
+                            .collect(),
+                    })
                 })
-            })
-            .warn_map_err(|e| {
-                if e.is_invalid_path() {
-                    return Status::invalid_argument(
-                        "Cannot calculate tree for path that is not a directory",
-                    );
-                } else if e.is_node_not_found() {
-                    return Status::not_found("A node in the tree could not be found");
-                }
-                Status::internal(e.to_string())
-            })
+                .warn_map_err(|e| {
+                    if e.is_invalid_path() {
+                        return Status::invalid_argument(
+                            "Cannot calculate tree for path that is not a directory",
+                        );
+                    } else if e.is_node_not_found() {
+                        return Status::not_found("A node in the tree could not be found");
+                    }
+                    Status::internal(e.to_string())
+                })
         })
         .await
 }

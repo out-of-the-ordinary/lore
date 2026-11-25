@@ -183,6 +183,7 @@ where
     Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(transparent)]
 pub struct Context {
@@ -215,6 +216,7 @@ pub struct Context {
     Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(transparent)]
 pub struct Partition {
@@ -246,6 +248,7 @@ pub struct Partition {
     Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(transparent)]
 pub struct Hash {
@@ -277,6 +280,7 @@ pub const HASH_STRING_LENGTH: usize = std::mem::size_of::<Hash>() * 2;
     Immutable,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct Address {
     /// Content hash.
@@ -305,6 +309,7 @@ pub struct Address {
     Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct Fragment {
     /// Flags
@@ -326,6 +331,14 @@ pub struct FragmentReference {
     pub hash: Hash,
     /// Offset in the full uncompressed and reassembled content of this fragment
     pub offset_content: u64,
+}
+
+impl FragmentReference {
+    /// Whether this reference is a hole: one with the zero hash, which names no fragment and stands
+    /// for a range holding no data, from its offset to the next reference's, which reads as zeros.
+    pub fn is_hole(&self) -> bool {
+        self.hash.is_zero()
+    }
 }
 
 /// Lightweight sanity validator for a [`Fragment`] received from a remote peer

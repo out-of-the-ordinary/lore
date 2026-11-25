@@ -12,10 +12,12 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
 use lore_server::authnz::repository_authorizer::Action;
+use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_registry::RepositoryRegistry;
@@ -46,6 +48,7 @@ async fn seed_repository(
         immutable_store,
         mutable_store,
         id,
+        allow_all_repositories(),
     ));
     let metadata_hash = repository::metadata_store(
         repository.clone(),
@@ -173,9 +176,36 @@ async fn owner_not_service_account_lets_a_non_creator_delete() {
     .await;
 }
 
+/// `set-protected` delegates branch protection only, not deleting the
+/// repository.
+#[tokio::test]
+async fn set_protected_does_not_let_a_non_creator_delete() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let id = random::<RepositoryId>();
+        seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+        let status = handler(
+            verified_delete_request(id, &["write", "set-protected"], false),
+            &RepositoryRegistry::Unregistered,
+            &global_grants(),
+            immutable_store,
+            mutable_store,
+            &TestInstrumentProvider,
+        )
+        .await
+        .expect_err("set-protected does not administer the repository");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }))
+    .await;
+}
+
 /// The creator may delete only while they hold `write` on the repository:
 /// on Tier 2 a creator whose token grants another repository only is
-/// refused, and `write` on this one restores the creator's right.
+/// answered as for a missing repository, and `write` on this one restores
+/// the creator's right.
 #[tokio::test]
 async fn the_creator_must_reach_the_repository_to_delete() {
     let (immutable_store, mutable_store, execution) =
@@ -195,7 +225,7 @@ async fn the_creator_must_reach_the_repository_to_delete() {
         )
         .await
         .expect_err("a creator with no grant on the repository may not delete");
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(status.code(), tonic::Code::NotFound);
 
         handler(
             creator_request(id, id),
@@ -228,6 +258,7 @@ async fn teardown_releases_every_name_mapping() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 id,
+                allow_all_repositories(),
             ));
             let write_token = get_write_token();
             let mut branches = Vec::new();
@@ -327,6 +358,49 @@ async fn teardown_releases_every_name_mapping() {
     }
 }
 
+/// On the auth-service tier an access token's grants are its `resources`
+/// claim. Deleting a repository the claim does not name is answered exactly as
+/// deleting a missing one, so the token cannot tell which ids exist.
+#[tokio::test]
+async fn a_repository_the_token_cannot_look_up_is_answered_as_missing() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AuthClientAuthorizer::new(
+            "https://auth.invalid".to_string(),
+        ));
+        let existing = random::<RepositoryId>();
+        let missing = random::<RepositoryId>();
+        let granted = random::<RepositoryId>();
+        seed_repository(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            existing,
+            "alice",
+        )
+        .await;
+
+        let mut answers = Vec::new();
+        for id in [existing, missing] {
+            let status = handler(
+                creator_request(id, granted),
+                &RepositoryRegistry::Unregistered,
+                &authorizer,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect_err("the token names neither repository");
+            assert_eq!(status.code(), tonic::Code::NotFound);
+            answers.push(status.message().replace(&id.to_string(), "<id>"));
+        }
+        assert_eq!(answers[0], answers[1]);
+    }))
+    .await;
+}
+
 mod zero_repository_id {
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 
@@ -365,10 +439,63 @@ mod zero_repository_id {
                 immutable_store,
                 mutable_store,
                 namespace_root,
+                allow_all_repositories(),
             ));
             repository::metadata_hash(repository)
                 .await
                 .expect("the stored metadata must survive");
+        }))
+        .await;
+    }
+}
+
+mod cancelled_request {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    /// A cancelled delete answers CANCELLED before it tears down any of the repository.
+    #[tokio::test]
+    async fn answers_cancelled_and_deletes_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let id = random::<RepositoryId>();
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            let status = with_request_cancellation(
+                cancellation,
+                handler(
+                    delete_request(id, AuthorizationToken::default()),
+                    &RepositoryRegistry::Unregistered,
+                    &(Arc::new(AllowAllRepositoryAuthorizer) as Arc<dyn RepositoryAuthorizer>),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &TestInstrumentProvider,
+                ),
+            )
+            .await
+            .expect_err("a cancelled delete stops before it deletes");
+            assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                id,
+                allow_all_repositories(),
+            ));
+            repository::metadata_hash(repository.clone())
+                .await
+                .expect("the stored metadata survives");
+            let mapped = repository::id_from_name(repository, "the-repository")
+                .await
+                .expect("the name still maps to the repository");
+            assert_eq!(mapped, id);
         }))
         .await;
     }

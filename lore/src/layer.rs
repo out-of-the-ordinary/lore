@@ -21,7 +21,9 @@ mod list;
 mod remove;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(layer_add_local)]
 /// Arguments for adding a layer from a source repository into the current repository.
 pub struct LoreLayerAddArgs {
@@ -55,12 +57,12 @@ pub struct LoreLayerAddArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LayerAdd`](crate::interface::LoreEvent::LayerAdd) | Emitted when a layer has been successfully added |
-pub async fn layer_add(
+pub fn layer_add(
     globals: LoreGlobalArgs,
     args: LoreLayerAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, layer_add_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, layer_add_local)
 }
 
 fn layer_add_local(
@@ -100,7 +102,9 @@ async fn layer_add_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(layer_remove_local)]
 /// Arguments for removing a layer from the repository at the specified path.
 pub struct LoreLayerRemoveArgs {
@@ -139,12 +143,12 @@ pub struct LoreLayerRemoveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LayerRemove`](crate::interface::LoreEvent::LayerRemove) | Emitted when a layer has been successfully removed |
-pub async fn layer_remove(
+pub fn layer_remove(
     globals: LoreGlobalArgs,
     args: LoreLayerRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, layer_remove_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, layer_remove_local)
 }
 
 fn layer_remove_local(
@@ -181,7 +185,9 @@ async fn layer_remove_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(layer_list_local)]
 /// Arguments for listing all layers configured in the repository (no parameters).
 pub struct LoreLayerListArgs {}
@@ -206,12 +212,12 @@ pub struct LoreLayerListArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LayerEntry`](crate::interface::LoreEvent::LayerEntry) | Emitted for each layer configured in the repository |
-pub async fn layer_list(
+pub fn layer_list(
     globals: LoreGlobalArgs,
     args: LoreLayerListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, layer_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, layer_list_local)
 }
 
 fn layer_list_local(
@@ -229,7 +235,9 @@ fn layer_list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(layer_list_staged_local)]
 /// Arguments for listing configured layers that have staged changes (no parameters).
 pub struct LoreLayerListStagedArgs {}
@@ -257,12 +265,12 @@ pub struct LoreLayerListStagedArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LayerStagedEntry`](crate::interface::LoreEvent::LayerStagedEntry) | One per layer with staged changes |
-pub async fn layer_list_staged(
+pub fn layer_list_staged(
     globals: LoreGlobalArgs,
     args: LoreLayerListStagedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, layer_list_staged_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, layer_list_staged_local)
 }
 
 fn layer_list_staged_local(

@@ -126,6 +126,9 @@ mod tests {
         ("layered/x/y/z/three.tmp", Some("three"), Some("three")),
         ("layered/x/y/z/four.txt", Some("four"), Some("four")),
     ];
+    /// A directory under [`LAYERED`] whose content both revisions share, so a walk rooted there
+    /// reports only what the two views make differ.
+    const SHARED_LAYER: &str = "layered/x";
     /// View rules, each run against every one of them by a walk over [`LAYERED`]. They span anchored
     /// literals, the `/*` family, `dir/*`, brace groups, `/**` and `**/`, name rules, re-inclusions
     /// nested under exclusions, and rules whose depth bound stops short of the deepest changes.
@@ -482,7 +485,8 @@ mod tests {
 
     /// The changes a walk from `from` to `to` has to report below [`LAYERED`]: a path one side
     /// alone has [`held`] is added or deleted, and a file both hold is modified where its content
-    /// differs.
+    /// differs. A directory one view keeps and the other excludes while holding a path held below
+    /// it is on disk under both, so it changes only where one side alone holds it.
     fn predicted(from: &Filter, to: &Filter) -> Vec<(String, String)> {
         let older = held(
             from,
@@ -977,6 +981,82 @@ mod tests {
                             "from {from_rules:?} to {to_rules:?}"
                         );
                     }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Literal cases over [`SHARED_LAYER`] of a directory one view keeps and the other excludes.
+    /// `layered/x/y/z` holds only files `/layered/x/y/z/*` excludes, a view that keeps the
+    /// directory, as one re-including it as well does. `/layered/x/y/z/` with
+    /// `!/layered/x/y/z/four.txt` excludes the directory and keeps a file in it, and with
+    /// `!/layered/x/y/z/none.txt` keeps nothing in it. The directory is added or deleted where one
+    /// view keeps it and the other excludes it and keeps nothing below it, and otherwise only the
+    /// files in it change.
+    #[tokio::test]
+    async fn a_directory_changes_only_where_one_view_keeps_it_and_the_other_excludes_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_layered(immutable_store, mutable_store).await;
+                let emptied: &[&str] = &["/layered/x/y/z/*"];
+                let re_included: &[&str] = &["!/layered/x/y/z/", "/layered/x/y/z/*"];
+                let walked: &[&str] = &["/layered/x/y/z/", "!/layered/x/y/z/four.txt"];
+                let hidden: &[&str] = &["/layered/x/y/z/", "!/layered/x/y/z/none.txt"];
+                type Case = (
+                    &'static [&'static str],
+                    &'static [&'static str],
+                    &'static [(&'static str, &'static str)],
+                );
+                let cases: &[Case] = &[
+                    (&[], &["!/layered/x/y/z/"], &[]),
+                    (emptied, re_included, &[]),
+                    (re_included, emptied, &[]),
+                    (walked, emptied, &[("D", "layered/x/y/z/four.txt")]),
+                    (emptied, walked, &[("A", "layered/x/y/z/four.txt")]),
+                    (walked, &[], &[("A", "layered/x/y/z/three.tmp")]),
+                    (&[], walked, &[("D", "layered/x/y/z/three.tmp")]),
+                    (hidden, emptied, &[("A", "layered/x/y/z")]),
+                    (emptied, hidden, &[("D", "layered/x/y/z")]),
+                    (
+                        &[],
+                        re_included,
+                        &[
+                            ("D", "layered/x/y/z/four.txt"),
+                            ("D", "layered/x/y/z/three.tmp"),
+                        ],
+                    ),
+                    (
+                        re_included,
+                        &[],
+                        &[
+                            ("A", "layered/x/y/z/four.txt"),
+                            ("A", "layered/x/y/z/three.tmp"),
+                        ],
+                    ),
+                ];
+
+                for (from_rules, to_rules, expected) in cases {
+                    let (changes, _) = fixture
+                        .walk(
+                            fixture.view(from_rules),
+                            fixture.view(to_rules),
+                            SHARED_LAYER,
+                        )
+                        .await;
+
+                    let expected = expected
+                        .iter()
+                        .map(|(action, path)| (action.to_string(), path.to_string()))
+                        .collect();
+                    assert_eq!(
+                        by_path_and_action(changes),
+                        by_path_and_action(expected),
+                        "from {from_rules:?} to {to_rules:?}"
+                    );
                 }
             }))
             .await
